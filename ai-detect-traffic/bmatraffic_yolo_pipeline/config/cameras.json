@@ -1,0 +1,23 @@
+{
+  "timezone": "Asia/Bangkok",
+  "cameras": [
+    {
+      "name": "สะพานลอยใกล้ซอยสาทร 12 (ID996)",
+      "slug": "sathon12_footbridge_id996",
+      "url": "http://www.bmatraffic.com/PlayVideo.aspx?ID=996",
+      "snapshot_url": "http://www.bmatraffic.com/show.aspx?image=996", 
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "th,en;q=0.9,en-US;q=0.8",
+        "Referer": "http://www.bmatraffic.com/PlayVideo.aspx?ID=996",
+        "Cookie": "ASP.NET_SessionId=placeholder",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors", 
+        "Sec-Fetch-Site": "same-origin"
+      },
+      "enabled": true
+    }
+  ]
+}
