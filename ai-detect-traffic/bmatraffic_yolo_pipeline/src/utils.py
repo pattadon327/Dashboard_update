@@ -1,8 +1,9 @@
 import time, math, json, os, re, pytz, pandas as pd
 from datetime import datetime, timedelta
 
-# กำหนดประเภทรถที่ต้องการนับด้วย YOLO
-VEHICLE_CLASS_NAMES = {"car", "motorcycle", "bus", "truck", "bicycle"}
+# กำหนดประเภทยานพาหนะที่ต้องการนับด้วย YOLO (ไม่รวมคน)
+# COCO dataset class IDs: 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
+VEHICLE_CLASS_NAMES = {"bicycle", "car", "motorcycle", "bus", "truck"}
 
 def now_local(tz_name="Asia/Bangkok"):
     tz = pytz.timezone(tz_name)
@@ -36,7 +37,14 @@ def class_filter_map(model):
     """
     # Build mapping from model.names id -> label string
     id_to_name = {int(i): n for i, n in model.names.items()} if hasattr(model, "names") else {}
-    return {i: n for i, n in id_to_name.items() if n in VEHICLE_CLASS_NAMES}
+    print(f"[debug] Full model.names: {id_to_name}")
+    
+    # Filter only vehicle classes
+    filtered_map = {i: n for i, n in id_to_name.items() if n in VEHICLE_CLASS_NAMES}
+    print(f"[debug] VEHICLE_CLASS_NAMES: {VEHICLE_CLASS_NAMES}")
+    print(f"[debug] Filtered class map: {filtered_map}")
+    
+    return filtered_map
 
 
 def get_lag_values(csv_path, current_time, bin_minutes=5):

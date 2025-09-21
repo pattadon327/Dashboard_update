@@ -6,6 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import os
+import time
 from PIL import Image
 
 # Set page configuration
@@ -64,13 +65,27 @@ def load_data():
         st.error(f"Error loading training data: {e}")
         return None
 
-# Load current data for prediction (no target_next_1h)
-@st.cache_data(ttl=300)  # Cache for 5 minutes (300 seconds)
+# Load current data for prediction (no target_next_1h) - NO CACHE for real-time updates
 def load_current_data():
-    """Load the current data for prediction"""
+    """Load the current data for prediction - refreshes every time to get latest data"""
     try:
-        # df = pd.read_csv('D:/eco_project/predict_cut.csv')
-        df = pd.read_csv('D:/eco_project/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/sathon12_footbridge_id996_5min.csv')
+        csv_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/sathon12_footbridge_id996_5min.csv'
+        
+        # Check if file exists
+        if not os.path.exists(csv_path):
+            st.error(f"CSV file not found: {csv_path}")
+            return None
+            
+        # Get file modification time for freshness check
+        file_mod_time = datetime.fromtimestamp(os.path.getmtime(csv_path))
+        
+        # Load CSV without any caching
+        df = pd.read_csv(csv_path)
+        
+        if df.empty:
+            st.warning("CSV file is empty")
+            return None
+            
         df['timestamp'] = pd.to_datetime(df['timestamp'], format='%d/%m/%Y %H:%M')
         
         # Encode day_of_week to numeric for consistency
@@ -79,38 +94,50 @@ def load_current_data():
             'Friday': 4, 'Saturday': 5, 'Sunday': 6
         })
         
+        # Add file metadata for debugging
+        df.attrs['file_mod_time'] = file_mod_time
+        df.attrs['records_count'] = len(df)
+        df.attrs['load_time'] = datetime.now()
+        
         return df
     except Exception as e:
         st.error(f"Error loading current data: {e}")
         return None
 
 # Load CCTV images
-@st.cache_data(ttl=300)  # Cache for 5 minutes (300 seconds)
 def load_cctv_images():
-    """Load CCTV images - raw and detected"""
+    """Load CCTV images - raw and detected with force refresh"""
     images = {}
     
     # Raw image path
-    raw_image_path = 'D:/eco_project/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id996.jpg.raw.jpg'
-    # Detected image path  
-    detected_image_path = 'D:/eco_project/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id996.jpg'
-    
+    raw_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id996.jpg.raw.jpg'
+    # Detected image path
+    detected_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id996.jpg'
+
     try:
         # Load raw image
         if os.path.exists(raw_image_path):
+            # Add timestamp to force reload from disk
+            import time
+            current_time = time.time()
             images['raw'] = Image.open(raw_image_path)
             images['raw_timestamp'] = datetime.fromtimestamp(os.path.getmtime(raw_image_path))
+            images['raw_load_time'] = current_time
         else:
             images['raw'] = None
             images['raw_timestamp'] = None
+            images['raw_load_time'] = None
             
         # Load detected image
         if os.path.exists(detected_image_path):
+            current_time = time.time()
             images['detected'] = Image.open(detected_image_path)
             images['detected_timestamp'] = datetime.fromtimestamp(os.path.getmtime(detected_image_path))
+            images['detected_load_time'] = current_time
         else:
             images['detected'] = None
             images['detected_timestamp'] = None
+            images['detected_load_time'] = None
             
     except Exception as e:
         st.error(f"Error loading CCTV images: {e}")
@@ -118,6 +145,8 @@ def load_cctv_images():
         images['detected'] = None
         images['raw_timestamp'] = None
         images['detected_timestamp'] = None
+        images['raw_load_time'] = None
+        images['detected_load_time'] = None
     
     return images
 
@@ -157,6 +186,8 @@ def main():
     # Load model and data
     model = load_model()
     data = load_data()
+    
+    # Load current data fresh every time (no caching for real-time updates)
     current_data = load_current_data()
     
     if model is None or data is None:
@@ -174,47 +205,183 @@ def main():
     else:
         model_info_page(model, data)
 
+def display_live_images():
+    """Display CCTV images with auto-refresh capability"""
+    
+    # Create containers for images
+    st.subheader("📹 Live CCTV Images - Sathon 12 Footbridge")
+    
+    # Auto-refresh toggle
+    col_toggle, col_interval = st.columns([2, 1])
+    with col_toggle:
+        auto_refresh = st.checkbox("Auto-refresh images", value=True, help="Automatically refresh images every 30 seconds")
+    with col_interval:
+        refresh_interval = st.selectbox("Refresh interval", [15, 30, 60, 120], index=1, help="Seconds between refreshes")
+    
+    # Create placeholder containers for images
+    img_container = st.container()
+    status_container = st.container()
+    
+    # Initial load
+    with img_container:
+        img_col1, img_col2 = st.columns(2)
+        
+        with img_col1:
+            st.write("**YOLO Detected Image**")
+            detected_placeholder = st.empty()
+        
+        with img_col2:
+            st.write("**Raw CCTV Image**")
+            raw_placeholder = st.empty()
+    
+    with status_container:
+        status_placeholder = st.empty()
+    
+    # Function to update images
+    def update_images():
+        # Force reload images without cache
+        images = load_cctv_images()
+        
+        # Update detected image
+        with detected_placeholder.container():
+            if images['detected'] is not None:
+                st.image(images['detected'], 
+                        caption=f"Detected - Last updated: {images['detected_timestamp']}", 
+                        use_column_width=True)
+            else:
+                st.error("❌ Detected image not available")
+        
+        # Update raw image
+        with raw_placeholder.container():
+            if images['raw'] is not None:
+                st.image(images['raw'], 
+                        caption=f"Raw - Last updated: {images['raw_timestamp']}", 
+                        use_column_width=True)
+            else:
+                st.error("❌ Raw image not available")
+        
+        # Update status
+        with status_placeholder.container():
+            if images['detected_timestamp'] and images['raw_timestamp']:
+                time_since_update = (datetime.now() - max(images['detected_timestamp'], images['raw_timestamp'])).total_seconds() / 60
+                current_time = datetime.now().strftime("%H:%M:%S")
+                
+                if time_since_update <= 5:
+                    st.success(f"🟢 Images are fresh (updated {time_since_update:.1f} minutes ago) - Last check: {current_time}")
+                elif time_since_update <= 15:
+                    st.warning(f"🟡 Images are moderately fresh (updated {time_since_update:.1f} minutes ago) - Last check: {current_time}")
+                else:
+                    st.error(f"🔴 Images may be stale (updated {time_since_update:.1f} minutes ago) - Last check: {current_time}")
+            else:
+                st.error("❌ Could not determine image timestamps")
+        
+        return images
+    
+    # Initial load
+    images = update_images()
+    
+    # Auto-refresh logic
+    if auto_refresh:
+        # Auto-refresh using session state and rerun
+        if 'last_refresh' not in st.session_state:
+            st.session_state.last_refresh = time.time()
+        
+        current_time = time.time()
+        if current_time - st.session_state.last_refresh >= refresh_interval:
+            st.session_state.last_refresh = current_time
+            images = update_images()
+            # Small delay to prevent too frequent refreshes
+            time.sleep(1)
+            st.rerun()
+    
+    return images
+
+def check_data_freshness():
+    """Check if CSV data is fresh and return status information"""
+    csv_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/sathon12_footbridge_id996_5min.csv'
+    
+    try:
+        if not os.path.exists(csv_path):
+            return {
+                'status': 'error',
+                'message': 'CSV file not found',
+                'file_mod_time': None,
+                'minutes_ago': None,
+                'file_size': 0
+            }
+        
+        # Get file information
+        file_mod_time = datetime.fromtimestamp(os.path.getmtime(csv_path))
+        file_size = os.path.getsize(csv_path)
+        time_diff = (datetime.now() - file_mod_time).total_seconds() / 60  # minutes
+        
+        # Determine status based on file age
+        if time_diff <= 5:
+            status = 'fresh'
+            status_emoji = '🟢'
+        elif time_diff <= 15:
+            status = 'moderate'
+            status_emoji = '🟡'
+        else:
+            status = 'stale'
+            status_emoji = '🔴'
+        
+        return {
+            'status': status,
+            'status_emoji': status_emoji,
+            'message': f'File updated {time_diff:.1f} minutes ago',
+            'file_mod_time': file_mod_time,
+            'minutes_ago': time_diff,
+            'file_size': file_size
+        }
+        
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': f'Error checking file: {str(e)}',
+            'file_mod_time': None,
+            'minutes_ago': None,
+            'file_size': 0
+        }
+
 def prediction_page(model, data, current_data):
     """Page for making predictions"""
     
-    # Load CCTV images
-    images = load_cctv_images()
-    
-    # Add CCTV Images Section
-    st.subheader("📹 Live CCTV Images - Sathon 12 Footbridge")
-    
-    # Display images side by side
-    img_col1, img_col2 = st.columns(2)
-    
-    with img_col1:
-        st.write("**YOLO Detected Image**")
-        if images['detected'] is not None:
-            st.image(images['detected'], caption=f"Detected - Last updated: {images['detected_timestamp']}", use_column_width=True)
-        else:
-            st.error("❌ Detected image not available")
-    
-    with img_col2:
-        st.write("**Raw CCTV Image**")
-        if images['raw'] is not None:
-            st.image(images['raw'], caption=f"Raw - Last updated: {images['raw_timestamp']}", use_column_width=True)
-        else:
-            st.error("❌ Raw image not available")
-    
-    # Image refresh status
-    if images['detected_timestamp'] and images['raw_timestamp']:
-        time_since_update = (datetime.now() - max(images['detected_timestamp'], images['raw_timestamp'])).total_seconds() / 60
-        if time_since_update <= 5:
-            st.success(f"🟢 Images are fresh (updated {time_since_update:.1f} minutes ago)")
-        elif time_since_update <= 15:
-            st.warning(f"🟡 Images are moderately fresh (updated {time_since_update:.1f} minutes ago)")
-        else:
-            st.error(f"🔴 Images may be stale (updated {time_since_update:.1f} minutes ago)")
+    # Display live images with auto-refresh
+    images = display_live_images()
     
     st.divider()
     
-    # Current data selector
+    # Current data selector with real-time refresh
     st.subheader("📊 Current Data for Prediction")
     st.info("💡 ข้อมูลปัจจุบันจาก CCTV ถนนสาทร")
+    
+    # Add data freshness check with auto-refresh
+    data_status_container = st.container()
+    
+    # Auto-refresh data every 30 seconds
+    if 'last_data_refresh' not in st.session_state:
+        st.session_state.last_data_refresh = time.time()
+    
+    current_time_check = time.time()
+    if current_time_check - st.session_state.last_data_refresh >= 30:  # 30 seconds
+        st.session_state.last_data_refresh = current_time_check
+        # Force reload current data
+        current_data = load_current_data()
+        st.rerun()
+    
+    # Display data freshness status
+    with data_status_container:
+        freshness_info = check_data_freshness()
+        if freshness_info['status'] == 'fresh':
+            st.success(f"{freshness_info['status_emoji']} **CSV Data Status:** Fresh - {freshness_info['message']} | Last check: {datetime.now().strftime('%H:%M:%S')}")
+        elif freshness_info['status'] == 'moderate':
+            st.warning(f"{freshness_info['status_emoji']} **CSV Data Status:** Moderate - {freshness_info['message']} | Last check: {datetime.now().strftime('%H:%M:%S')}")
+        elif freshness_info['status'] == 'stale':
+            st.error(f"{freshness_info['status_emoji']} **CSV Data Status:** Stale - {freshness_info['message']} | Last check: {datetime.now().strftime('%H:%M:%S')}")
+        else:
+            st.error(f"❌ **CSV Data Status:** Error - {freshness_info['message']}")
+    
     col_current1, col_current2 = st.columns([1.5, 1])
     
     with col_current1:
@@ -229,22 +396,26 @@ def prediction_page(model, data, current_data):
                 format_func=lambda x: f"{'⭐ Latest: ' if x == 0 else f'Record {x+1}: '}{latest_records.iloc[x]['timestamp']} - {latest_records.iloc[x]['vehicle_count']} vehicles"
             )
             
-            # Show data status
+            # Show enhanced data status with file information
             latest_time = current_data['timestamp'].max()
             time_diff = pd.Timestamp.now() - latest_time
             minutes_ago = int(time_diff.total_seconds() / 60)
             
-            if minutes_ago <= 5:
-                status_color = "🟢"
-                status_text = f"Fresh (updated {minutes_ago} min ago)"
-            elif minutes_ago <= 60:
-                status_color = "🟡"
-                status_text = f"Recent (updated {minutes_ago} min ago)"
-            else:
-                status_color = "🔴"
-                status_text = f"Outdated (updated {minutes_ago} min ago)"
+            # Get file metadata if available
+            file_info = ""
+            if hasattr(current_data, 'attrs'):
+                if 'file_mod_time' in current_data.attrs:
+                    file_mod_time = current_data.attrs['file_mod_time']
+                    file_info = f" | File modified: {file_mod_time.strftime('%H:%M:%S')}"
+                if 'records_count' in current_data.attrs:
+                    file_info += f" | Total records: {current_data.attrs['records_count']}"
             
-            st.info(f"{status_color} **Data Status:** {status_text}")
+
+            
+            # Show countdown until next refresh
+            time_until_refresh = 30 - (current_time_check - st.session_state.last_data_refresh)
+            if time_until_refresh > 0:
+                st.caption(f" ")
         else:
             st.error("❌ Cannot load current data. Using training data samples instead.")
             # Fallback to training data samples
@@ -263,13 +434,23 @@ def prediction_page(model, data, current_data):
         # Make buttons match the width and positioning of dropdown
         predict_btn = st.button("Current Predict", type="primary", use_container_width=True)
         if predict_btn:
-            # Directly predict with selected record
-            selected_record = latest_records.iloc[selected_idx]
+            # Force reload data before prediction to ensure latest
+            fresh_data = load_current_data()
+            if fresh_data is not None and not fresh_data.empty:
+                fresh_records = fresh_data.tail(5).reset_index(drop=True)
+                fresh_records = fresh_records.iloc[::-1]
+                selected_record = fresh_records.iloc[min(selected_idx, len(fresh_records)-1)]
+            else:
+                selected_record = latest_records.iloc[selected_idx]
+            
             st.session_state.auto_predict = True
             st.session_state.predict_record = selected_record
             st.rerun()
         
-        # Add some space between buttons
+        # Add manual refresh button
+    
+            st.session_state.last_data_refresh = 0  # Force immediate refresh
+            st.rerun()
         
         reset_btn = st.button("Reset", use_container_width=True)
         if reset_btn:

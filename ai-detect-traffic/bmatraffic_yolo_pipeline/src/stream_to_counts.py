@@ -196,8 +196,9 @@ def resolve_stream_url(url: str, headers=None):
     return url
 
 
-# กำหนดประเภทรถที่ต้องการนับ
-SUPPORTED = {"car", "motorcycle", "bus", "truck", "bicycle", "person"}
+# กำหนดประเภทยานพาหนะที่ต้องการนับ (ต้องตรงกับ VEHICLE_CLASS_NAMES ใน utils.py)
+# COCO dataset class IDs: 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck  
+SUPPORTED = {"bicycle", "car", "motorcycle", "bus", "truck"}
 
 def open_stream(url: str):
     cap = cv2.VideoCapture(url)
@@ -606,46 +607,47 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
 
                 # Initialize window if needed
                 if win_start is None or ts >= win_end:
-                    # Flush previous window to CSV
+                    # Window transition - prepare for next point-in-time detection
                     if win_start is not None:
-                        # เขียนข้อมูลลง CSV เมื่อสิ้นสุดหน้าต่างเวลา (5 นาที)
-                        write_window(csv_path, win_start, win_end, counts, frames_processed, tz)
-                        print(f"[window] End of 5-minute window. Total vehicles: {sum(counts.values())} | Details: {counts}")
+                        print(f"[window] Transitioning from {win_start.strftime('%H:%M')} window to next 5-minute mark")
+                        # CSV already written during point-in-time detection, no need to write again
                         
                     # Reset for new window
                     win_start, win_end = align_to_window(ts, bin_minutes, tz)
-                    print(f"[window] Starting new 5-minute window: {win_start.strftime('%H:%M')} - {win_end.strftime('%H:%M')}")
+                    print(f"[window] ===== NEW 5-MINUTE WINDOW =====")
+                    print(f"[window] Target time: {win_start.strftime('%H:%M')}")
+                    print(f"[window] Window range: {win_start.strftime('%H:%M')} - {win_end.strftime('%H:%M')}")
+                    print(f"[window] Will perform ONE point-in-time detection at {win_start.strftime('%H:%M')}")
+                    print(f"[window] ================================")
                     counts = {k: 0 for k in SUPPORTED}  # รีเซ็ตการนับสำหรับหน้าต่างใหม่
                     frames_processed = 0
                     vehicle_counted_for_window = False  # รีเซ็ตตัวแปรบอกว่ายังไม่ได้นับรถในหน้าต่างเวลาใหม่นี้
                     
-                    # จะทำการแคปรูปและนับเมื่อได้รับเฟรมที่เหมาะสม
-                    print(f"[capture] Will capture and count vehicles once in this 5-minute window")
-                    
                 # ตรวจสอบว่าเราได้นับรถในหน้าต่างเวลานี้ไปแล้วหรือยัง
-                # เราจะนับรถเพียงครั้งเดียวในแต่ละหน้าต่างเวลา 5 นาที
+                # เราจะนับรถเพียงครั้งเดียวในแต่ละหน้าต่างเวลา 5 นาที (point-in-time detection)
                 if vehicle_counted_for_window:
                     # ข้ามการประมวลผล YOLO เนื่องจากได้นับรถไปแล้วในหน้าต่างเวลานี้
-                    print(f"[skip] Already counted vehicles in this window ({win_start.strftime('%H:%M')} - {win_end.strftime('%H:%M')}), skipping YOLO processing")
+                    print(f"[skip] Already counted vehicles for window {win_start.strftime('%H:%M')} - waiting for next 5-minute mark")
+                    
+                    # หยุดการทำงานจนกว่าจะถึงหน้าต่างเวลาถัดไป
+                    time_until_next_window = (win_end - ts).total_seconds()
+                    if time_until_next_window > 30:  # ถ้าเหลือเวลามากกว่า 30 วินาที ให้หยุดรอ
+                        sleep_time = min(30, time_until_next_window - 10)  # รอแต่ไม่เกิน 30 วินาที
+                        print(f"[sleep] Waiting {sleep_time:.1f} seconds until next detection window")
+                        time.sleep(sleep_time)
                     continue
                 else:
-                    # แสดงข้อความว่าเรากำลังจะนับรถในหน้าต่างเวลานี้
-                    print(f"[count] Counting vehicles for window: {win_start.strftime('%H:%M')} - {win_end.strftime('%H:%M')}")
+                    # แสดงข้อความว่าเรากำลังจะนับรถในจุดเวลานี้
+                    print(f"[point-detection] Performing point-in-time detection for {win_start.strftime('%H:%M')}")
+                    print(f"[point-detection] This will be the ONLY detection for this 5-minute window")
 
                 # Check if frame is valid for YOLO
                 if frame is None or frame.size == 0:
                     print("[warning] Skipping invalid frame for YOLO inference")
                     continue
                 
-                # ตรวจสอบสภาพแสงและปรับปรุงภาพก่อนส่งเข้า YOLO
-                lighting_condition = detect_lighting_condition(frame)
-                print(f"[lighting] Detected lighting condition: {lighting_condition}")
-                
-                # สร้างภาพที่ปรับปรุงแล้วสำหรับ YOLO (แต่ยังคงบันทึกภาพต้นฉบับ)
-                enhanced_frame = enhance_image_for_detection(frame)
-                
-                # ตรวจสอบภาพและบันทึก snapshot ดิบสำหรับหน้าต่างเวลานี้ 
-                # (snapshot ที่มีการวาดเพิ่มเติมจะถูกบันทึกในภายหลัง)
+                # ตรวจสอบภาพและบันทึก snapshot ดิบสำหรับจุดเวลานี้ (point-in-time snapshot) ก่อนทำ YOLO
+                # จะบันทึกภาพเพียง 1 ครั้งต่อหน้าต่างเวลา 5 นาที เป็นตัวแทนของช่วงเวลานั้น
                 if last_snapshot_window_start != win_start:
                     try:
                         # บันทึกภาพต้นฉบับ (ไม่ใช่ภาพที่ปรับปรุงแล้ว) และตรวจสอบว่าเป็นภาพขาวหรือไม่
@@ -654,10 +656,11 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                         if is_valid_image:
                             # ถ้าภาพสมบูรณ์ ให้บันทึกเวลาหน้าต่างและทำการนับต่อไป
                             last_snapshot_window_start = win_start
-                            print(f"Valid raw snapshot saved: {os.path.basename(snapshot_path)}.raw.jpg @ {win_start.strftime('%Y-%m-%d %H:%M')}")
+                            print(f"[point-snapshot] Raw snapshot saved for time point: {win_start.strftime('%Y-%m-%d %H:%M')}")
+                            print(f"[point-snapshot] This snapshot represents the exact 5-minute mark")
                         else:
                             # ถ้าภาพเป็นภาพขาว ให้ลองสร้าง session ใหม่
-                            print(f"[retry] Blank image detected, trying to reconnect with new session...")
+                            print(f"[retry] Blank image detected at time point {win_start.strftime('%H:%M')}, trying to reconnect...")
                             
                             # สร้าง session ใหม่เพื่อลองเชื่อมต่อใหม่
                             if snapshot_mode and session:
@@ -672,7 +675,7 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
                                         "Accept-Language": "th,en;q=0.9,en-US;q=0.8",
                                     }
-                                    print("[session] Creating a new session due to blank image...")
+                                    print("[session] Creating new session for better image quality...")
                                     session.get("http://www.bmatraffic.com/", headers=main_page_headers, timeout=10)
                                     session.get(referer_url, headers=main_page_headers, timeout=10)
                                     # แสดง cookies ที่ได้
@@ -681,7 +684,7 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                                     
                                     # ไม่ให้นับในหน้าต่างนี้ เพื่อลองใหม่ในเฟรมถัดไป
                                     vehicle_counted_for_window = False
-                                    print(f"[retry] Will try to count again in next frame with new session")
+                                    print(f"[retry] Will retry point-detection with new session")
                                     
                                     # ข้ามการประมวลผล YOLO ในรอบนี้
                                     continue
@@ -689,23 +692,111 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                                     print(f"[session] Error refreshing session: {e}")
                             
                     except Exception as se:
-                        print(f"Snapshot save failed: {se}")
+                        print(f"[point-snapshot] Error saving point-in-time snapshot: {se}")
+                        # ลองต่อไปแม้ snapshot จะบันทึกไม่ได้
+                        last_snapshot_window_start = win_start
+                
+                # โหลดภาพจากไฟล์ .raw.jpg ที่บันทึกไว้แล้วสำหรับ YOLO detection
+                # เพื่อให้ได้ผลลัพธ์ที่สอดคล้องกันระหว่างรูปดิบและรูปที่มีการวาด
+                yolo_frame = None
+                raw_image_path = snapshot_path + ".raw.jpg"
+                
+                if os.path.exists(raw_image_path):
+                    try:
+                        # โหลดภาพจากไฟล์ที่บันทึกไว้
+                        yolo_frame = cv2.imread(raw_image_path)
+                        if yolo_frame is not None:
+                            print(f"[yolo-input] Using saved raw image for detection: {raw_image_path}")
+                            print(f"[yolo-input] Raw image shape: {yolo_frame.shape}")
+                        else:
+                            print(f"[yolo-input] Failed to load raw image, using current frame")
+                            yolo_frame = frame
+                    except Exception as e:
+                        print(f"[yolo-input] Error loading raw image: {e}, using current frame")
+                        yolo_frame = frame
+                else:
+                    print(f"[yolo-input] Raw image file not found, using current frame")
+                    yolo_frame = frame
+                
+                # ตรวจสอบสภาพแสงและปรับปรุงภาพก่อนส่งเข้า YOLO (ใช้ yolo_frame)
+                lighting_condition = detect_lighting_condition(yolo_frame)
+                print(f"[lighting] Detected lighting condition: {lighting_condition}")
+                
+                # กำหนด confidence threshold ตามสภาพแสง
+                if lighting_condition == 'night':
+                    confidence_threshold = 0.10  # ลดลงสำหรับกลางคืน
+                elif lighting_condition == 'dawn_dusk':
+                    confidence_threshold = 0.12  # ค่ากลางสำหรับเวลาเช้า/เย็น
+                elif lighting_condition == 'bright':
+                    confidence_threshold = 0.20  # เพิ่มขึ้นสำหรับแสงจ้า (ลด false positive)
+                else:  # day
+                    confidence_threshold = 0.15  # ค่าปกติสำหรับกลางวัน
+                
+                print(f"[yolo] Using confidence threshold: {confidence_threshold:.2f} for {lighting_condition} conditions")
+                
+                # สร้างภาพที่ปรับปรุงแล้วสำหรับ YOLO จากภาพ raw ที่โหลดมา
+                enhanced_frame = enhance_image_for_detection(yolo_frame)
+                
+                # ตรวจสอบภาพและบันทึก snapshot ดิบสำหรับจุดเวลานี้ (point-in-time snapshot)
+                # จะบันทึกภาพเพียง 1 ครั้งต่อหน้าต่างเวลา 5 นาที เป็นตัวแทนของช่วงเวลานั้น
+                if last_snapshot_window_start != win_start:
+                    try:
+                        # บันทึกภาพต้นฉบับ (ไม่ใช่ภาพที่ปรับปรุงแล้ว) และตรวจสอบว่าเป็นภาพขาวหรือไม่
+                        is_valid_image = save_snapshot(snapshot_path + ".raw.jpg", frame)
+                        
+                        if is_valid_image:
+                            # ถ้าภาพสมบูรณ์ ให้บันทึกเวลาหน้าต่างและทำการนับต่อไป
+                            last_snapshot_window_start = win_start
+                            print(f"[point-snapshot] Raw snapshot saved for time point: {win_start.strftime('%Y-%m-%d %H:%M')}")
+                            print(f"[point-snapshot] This snapshot represents the exact 5-minute mark")
+                        else:
+                            # ถ้าภาพเป็นภาพขาว ให้ลองสร้าง session ใหม่
+                            print(f"[retry] Blank image detected at time point {win_start.strftime('%H:%M')}, trying to reconnect...")
+                            
+                            # สร้าง session ใหม่เพื่อลองเชื่อมต่อใหม่
+                            if snapshot_mode and session:
+                                try:
+                                    # ปิด session เดิม
+                                    session.close()
+                                    # สร้าง session ใหม่
+                                    session = requests.Session()
+                                    # เข้าหน้าหลัก + หน้า PlayVideo อีกครั้ง
+                                    main_page_headers = {
+                                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                                        "Accept-Language": "th,en;q=0.9,en-US;q=0.8",
+                                    }
+                                    print("[session] Creating new session for better image quality...")
+                                    session.get("http://www.bmatraffic.com/", headers=main_page_headers, timeout=10)
+                                    session.get(referer_url, headers=main_page_headers, timeout=10)
+                                    # แสดง cookies ที่ได้
+                                    cookies_str = '; '.join([f"{c.name}={c.value}" for c in session.cookies])
+                                    print(f"[session] New session established with cookies: {cookies_str}")
+                                    
+                                    # ไม่ให้นับในหน้าต่างนี้ เพื่อลองใหม่ในเฟรมถัดไป
+                                    vehicle_counted_for_window = False
+                                    print(f"[retry] Will retry point-detection with new session")
+                                    
+                                    # ข้ามการประมวลผล YOLO ในรอบนี้
+                                    continue
+                                except Exception as e:
+                                    print(f"[session] Error refreshing session: {e}")
+                            
+                    except Exception as se:
+                        print(f"[point-snapshot] Error saving point-in-time snapshot: {se}")
+                        # ลองต่อไปแม้ snapshot จะบันทึกไม่ได้
+                        last_snapshot_window_start = win_start
                 
                 # Draw rectangle for debug if display is enabled
                 if display:
-                    debug_frame = frame.copy()  # ใช้ภาพต้นฉบับสำหรับ display
-                    h, w = debug_frame.shape[:2]
-                    cv2.rectangle(debug_frame, (0, 0), (w-1, h-1), (0, 255, 0), 2)
-                    # เพิ่มข้อความแสดงว่านี่คือเฟรมที่ใช้ในการนับ
-                    cv2.putText(debug_frame, "COUNTING FRAME", (10, h-20), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    # แสดงสภาพแสง
-                    cv2.putText(debug_frame, f"Light: {lighting_condition}", (10, h-50), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    debug_frame = yolo_frame.copy()  # ใช้ภาพ raw ที่จะส่งเข้า YOLO
                 else:
-                    debug_frame = frame
+                    debug_frame = yolo_frame
                     
                 # YOLO inference - ใช้ภาพที่ปรับปรุงแล้ว
+                # กำหนดค่าเริ่มต้นสำหรับการแสดงผล
+                all_detections = []
+                
                 try:
                     print(f"[yolo] Running inference on enhanced frame: {enhanced_frame.shape} (lighting: {lighting_condition})")
                     res = model.predict(source=enhanced_frame, verbose=False, device=0 if os.environ.get("YOLO_GPU","").strip() else None)
@@ -717,6 +808,38 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                     r0 = res[0]
                     if r0.boxes is None or len(r0.boxes) == 0:  # no detections
                         print("[yolo] No objects detected")
+                        
+                        # ถึงแม้ไม่มีการตรวจจับ ก็ยังต้องบันทึก CSV เป็น 0
+                        vehicle_counted_for_window = True
+                        
+                        # บันทึกข้อมูลลง CSV ทันทีหลังจาก detection (point-in-time recording) - กรณีไม่มีรถ
+                        print(f"[point-csv] Writing point-in-time data to CSV for {win_start.strftime('%H:%M')} - NO VEHICLES DETECTED")
+                        write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes="point_detection_no_vehicles")
+                        print(f"[point-csv] Point-in-time vehicle count: 0")
+                        print(f"[point-csv] Next detection will be at: {win_end.strftime('%H:%M')}")
+                        
+                        # บันทึกภาพที่แสดงจำนวนรถ 0
+                        try:
+                            h, w = debug_frame.shape[:2]
+                            current_time = win_start.strftime("%H:%M")
+                            
+                            # แสดงจำนวนรถ 0
+                            cv2.putText(debug_frame, "Vehicles: 0", (10, 30), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                            
+                            # แสดงเวลา (ไม่แสดงวันที่)
+                            cv2.putText(debug_frame, f"Time: {current_time}", (10, 70), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                            
+                            # บันทึกภาพที่มีข้อมูลเพิ่มเติมแล้ว
+                            ok = cv2.imwrite(snapshot_path, debug_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                            if ok:
+                                print(f"[point-annotated] Successfully saved annotated image (no vehicles): {os.path.basename(snapshot_path)}")
+                            else:
+                                print(f"[point-annotated] Failed to save annotated image")
+                        except Exception as e:
+                            print(f"[point-annotated] Error saving annotated image: {e}")
+                        
                         frames_processed += 1
                         continue
 
@@ -728,19 +851,7 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                     # Log confidence scores
                     print(f"[yolo] Detected {len(cls_ids)} objects with confidence: {confidence_scores}")
                     
-                    # Apply confidence threshold แบบปรับตามสภาพแสง
-                    # กลางคืนใช้ threshold ที่ต่ำกว่าเพื่อจับรถได้มากขึ้น
-                    if lighting_condition == 'night':
-                        confidence_threshold = 0.10  # ลดลงสำหรับกลางคืน
-                    elif lighting_condition == 'dawn_dusk':
-                        confidence_threshold = 0.12  # ค่ากลางสำหรับเวลาเช้า/เย็น
-                    elif lighting_condition == 'bright':
-                        confidence_threshold = 0.20  # เพิ่มขึ้นสำหรับแสงจ้า (ลด false positive)
-                    else:  # day
-                        confidence_threshold = 0.15  # ค่าปกติสำหรับกลางวัน
-                    
-                    print(f"[yolo] Using confidence threshold: {confidence_threshold:.2f} for {lighting_condition} conditions")
-                    
+                    # กรองผลลัพธ์ด้วย confidence threshold ที่กำหนดไว้แล้ว
                     confident_detections = [(int(cid), score, box) 
                                           for cid, score, box in zip(cls_ids, confidence_scores, boxes) 
                                           if score > confidence_threshold]
@@ -753,36 +864,56 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                     all_detections = []  # เก็บข้อมูลทุกการตรวจจับไว้แสดงผล
                     for cid, score, box in confident_detections:
                         label = id2name.get(cid)
+                        # Debug: แสดงการแปลง class ID
+                        print(f"[debug] Class ID {cid} -> Label: {label} (confidence: {score:.2f})")
+                        
                         # เก็บข้อมูลการตรวจจับทั้งหมด
                         all_detections.append((cid, label or f"class_{cid}", score, box))
                         
-                        if label in SUPPORTED:
+                        if label and label in SUPPORTED:
                             # เพิ่มค่าในประเภทของรถที่ตรวจพบในเฟรมนี้
                             vehicles_in_frame[label] += 1
                             # บันทึกลงในการนับรวมของหน้าต่างเวลานี้ (นับแค่ครั้งเดียว)
                             counts[label] += 1
+                            print(f"[count] Added {label} to counts. Total {label}: {counts[label]}")
+                        else:
+                            print(f"[skip] Class ID {cid} (label: {label or 'None'}) not in SUPPORTED list: {SUPPORTED}")
                     
                     # แสดงการตรวจจับทั้งหมดที่พบ (ทั้งที่นับและไม่นับ)
                     print(f"[yolo] All detections: {[(d[1], d[2]) for d in all_detections]}")
+                    print(f"[yolo] Current counts after processing: {counts}")
+                    print(f"[yolo] Current vehicles_in_frame: {vehicles_in_frame}")
                     
                     # เปลี่ยนสถานะเป็นได้นับรถในหน้าต่างเวลานี้แล้ว (จะไม่นับซ้ำอีก)
                     vehicle_counted_for_window = True
                     
-                    # เขียนข้อมูลลง CSV ทันทีหลังการนับรถ (ไม่ต้องรอจนจบหน้าต่างเวลา)
-                    write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes="immediate_write")
-                    print(f"[csv] Immediately wrote counts to CSV: {sum(counts.values())} vehicles | Details: {counts}")
+                    # บันทึกข้อมูลลง CSV ทันทีหลังจาก detection (point-in-time recording)
+                    print(f"[point-csv] Writing point-in-time data to CSV for {win_start.strftime('%H:%M')}")
+                    write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes="point_detection")
+                    print(f"[point-csv] Point-in-time vehicle count: {sum(counts.values())} | Details: {counts}")
+                    print(f"[point-csv] Next detection will be at: {win_end.strftime('%H:%M')}")
                     
-                    # วาด boxes บน debug frame ทั้งในกรณี display และไม่ display (เพื่อให้บันทึกลงไฟล์ได้)
-                    x1, y1, x2, y2 = box
-                    # ใช้สีแดงสำหรับกรอบรถ
-                    cv2.rectangle(debug_frame, 
-                                (int(x1), int(y1)), 
-                                (int(x2), int(y2)), 
-                                (0, 0, 255), 2)
-                    # แสดงป้ายกำกับและความเชื่อมั่น
-                    cv2.putText(debug_frame, f"{label}: {score:.2f}", 
-                                (int(x1), int(y1)-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    # แสดงสรุปการทำงาน point-in-time
+                    print(f"[point-summary] ===== POINT-IN-TIME DETECTION COMPLETE =====")
+                    print(f"[point-summary] Time: {win_start.strftime('%Y-%m-%d %H:%M')}")
+                    print(f"[point-summary] Total vehicles detected: {sum(counts.values())}")
+                    print(f"[point-summary] Detection details: {counts}")
+                    print(f"[point-summary] Raw image: {os.path.basename(snapshot_path)}.raw.jpg")
+                    print(f"[point-summary] Annotated image: {os.path.basename(snapshot_path)}")
+                    print(f"[point-summary] ==============================================")
+                    
+                    # วาดการตรวจจับทั้งหมดบน debug frame (ทั้งในกรณี display และไม่ display)
+                    for obj_class_id, obj_label, obj_score, obj_box in all_detections:
+                        x1, y1, x2, y2 = obj_box
+                        
+                        # กำหนดสีต่างกันระหว่างวัตถุที่นับ (สีแดง) และไม่นับ (สีน้ำเงิน)
+                        box_color = (0, 0, 255) if obj_label in SUPPORTED else (255, 0, 0)
+                        
+                        # วาดกรอบเท่านั้น ไม่ใส่ป้ายกำกับcurrent_time
+                        cv2.rectangle(debug_frame, 
+                                    (int(x1), int(y1)), 
+                                    (int(x2), int(y2)), 
+                                    box_color, 2)
                     
                     # แสดงจำนวนรถที่พบในเฟรมนี้
                     total_in_frame = sum(vehicles_in_frame.values())
@@ -794,77 +925,34 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
 
                 frames_processed += 1
 
-                # Optional display for debugging
-                # เตรียม debug_frame ใหม่เสมอเพื่อให้แน่ใจว่าเริ่มจากภาพสะอาด
-                debug_frame = frame.copy()
-                
-                # วาดเส้นกรอบสีเขียวรอบภาพ
+                # ปรับปรุง debug_frame เพื่อแสดงข้อมูลที่จำเป็นเท่านั้น
                 h, w = debug_frame.shape[:2]
-                cv2.rectangle(debug_frame, (0, 0), (w-1, h-1), (0, 255, 0), 2)
-                
-                # แสดงข้อความ "COUNTING FRAME" สีแดง
-                cv2.putText(debug_frame, "COUNTING FRAME", (10, h-20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 
                 # แสดงจำนวนรถรวมที่จับได้
                 total_vehicles = sum(counts.values())
                 cv2.putText(debug_frame, f"Vehicles: {total_vehicles}", (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                           
-                # แสดงค่า threshold และสภาพแสง
-                cv2.putText(debug_frame, f"Thresh: {confidence_threshold:.2f} ({lighting_condition})", (10, h-50), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
-                # แสดงการปรับปรุงภาพ (ถ้ามี)
-                if lighting_condition in ['night', 'dawn_dusk']:
-                    cv2.putText(debug_frame, "Enhanced for low light", (10, h-80), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                # แสดงเวลา (ไม่แสดงวันที่)
+                current_time = win_start.strftime("%H:%M")
+                cv2.putText(debug_frame, f"Time: {current_time}", (10, 70), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
-                # แสดงจำนวนรถแยกตามประเภท
-                y_pos = 60
-                for k, v in counts.items():
-                    if v > 0:
-                        cv2.putText(debug_frame, f"{k}: {v}", (10, y_pos), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                        y_pos += 25
-                
-                # บันทึกภาพที่มีการวาดเพิ่มเติมแล้ว (แทนที่จะบันทึกเฉพาะ frame ต้นฉบับ)
-                # บันทึกเฉพาะเมื่อได้นับรถในหน้าต่างเวลานี้ไปแล้วเท่านั้น
+                # บันทึกภาพที่มีการวาดเพิ่มเติมแล้ว (point-in-time annotated image)
+                # บันทึกทันทีหลังจาก detection เสร็จ
                 if vehicle_counted_for_window and last_snapshot_window_start == win_start:
                     try:
-                        print("[snapshot] Saving enhanced debug frame with detection results...")
-                        
-                        # วาดการตรวจจับทั้งหมด (รวมถึงวัตถุที่ไม่ใช่ประเภทที่เรานับ)
-                        for obj_class_id, obj_label, obj_score, obj_box in all_detections:
-                            x1, y1, x2, y2 = obj_box
-                            
-                            # กำหนดสีต่างกันระหว่างวัตถุที่นับ (สีแดง) และไม่นับ (สีน้ำเงิน)
-                            box_color = (0, 0, 255) if obj_label in SUPPORTED else (255, 0, 0)
-                            
-                            # วาดกรอบ
-                            cv2.rectangle(debug_frame, 
-                                        (int(x1), int(y1)), 
-                                        (int(x2), int(y2)), 
-                                        box_color, 2)
-                            
-                            # ใส่ป้ายกำกับ
-                            cv2.putText(debug_frame, f"{obj_label}: {obj_score:.2f}", 
-                                        (int(x1), int(y1)-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                        
-                        # เพิ่ม timestamp ที่มุมขวาบน
-                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        cv2.putText(debug_frame, timestamp, (w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                                   0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                        print(f"[point-annotated] Saving annotated image for time point: {win_start.strftime('%H:%M')}")
                         
                         # บันทึกภาพที่มีข้อมูลเพิ่มเติมแล้ว
                         ok = cv2.imwrite(snapshot_path, debug_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
                         if ok:
-                            print(f"[snapshot] Successfully saved enhanced debug frame to {snapshot_path}")
+                            print(f"[point-annotated] Successfully saved annotated image: {os.path.basename(snapshot_path)}")
+                            print(f"[point-annotated] Image shows detection results for exactly {current_time}")
                         else:
-                            print(f"[snapshot] Failed to save enhanced debug frame")
+                            print(f"[point-annotated] Failed to save annotated image")
                     except Exception as e:
-                        print(f"[snapshot] Error saving enhanced debug frame: {e}")
+                        print(f"[point-annotated] Error saving annotated image: {e}")
                 
                 if display:
                     try:
@@ -877,15 +965,17 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                         print(f"[display] Error showing frame: {e}")
 
         except KeyboardInterrupt:
-            # Flush and exit
-            if win_start is not None:
-                write_window(csv_path, win_start, win_end, counts, frames_processed, tz)
+            # Flush and exit - only write if we haven't written for current window yet
+            if win_start is not None and not vehicle_counted_for_window:
+                print(f"[exit] Writing final data for incomplete window: {win_start.strftime('%H:%M')}")
+                write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes="user_interrupt")
             print("Stopped by user.")
             break
         except Exception as e:
-            # On any error, flush partial and retry after short delay
-            if win_start is not None:
-                write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes=f"reconnect: {e}")
+            # On any error, flush partial data only if not already written
+            if win_start is not None and not vehicle_counted_for_window:
+                print(f"[error] Writing partial data due to error: {e}")
+                write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes=f"error: {e}")
             else:
                 print(f"[reconnect] {e}")
             time.sleep(5)
@@ -905,14 +995,27 @@ def write_window(csv_path, win_start, win_end, counts, frames_processed, tz, not
     """บันทึกข้อมูลการนับรถลงในไฟล์ CSV ในรูปแบบที่เหมาะสำหรับโมเดล ML"""
     from utils import get_lag_values  # Import here to avoid circular imports
     
-    # ใช้ end time เป็นเวลาอ้างอิง
-    dt = win_end
+    # ใช้ win_start เป็น timestamp เพื่อให้ตรงกับหน้าต่างเวลาที่กำหนด
+    dt = win_start
     
     # ข้อมูลหลัก - ใช้รูปแบบ timestamp ตามตัวอย่าง DD/MM/YYYY HH:MM
     formatted_timestamp = dt.strftime('%d/%m/%Y %H:%M')
     
+    # ตรวจสอบว่ามีข้อมูลซ้ำใน CSV หรือไม่
+    if os.path.exists(csv_path):
+        try:
+            existing_df = pd.read_csv(csv_path)
+            if not existing_df.empty and formatted_timestamp in existing_df['timestamp'].values:
+                print(f"[csv] Timestamp {formatted_timestamp} already exists in CSV, skipping write")
+                return
+        except Exception as e:
+            print(f"[csv] Warning: Could not check for duplicate timestamps: {e}")
+    
     # นับรวมรถทุกประเภทเป็น vehicle_count เพียงค่าเดียว พร้อมตรวจสอบค่าที่เกินจริง
     vehicle_count = sum(counts.values())
+    
+    # Debug: แสดงข้อมูลการนับรถ
+    print(f"[csv] Preparing to write: timestamp={formatted_timestamp}, vehicle_count={vehicle_count}, counts={counts}")
     
     # ตรวจสอบและแก้ไขค่าที่ผิดปกติ - ถ้าจำนวนรถสูงเกินไปสำหรับกล้องหนึ่งตัว (เช่น > 50 คัน)
     # อาจเป็นเพราะการตรวจจับผิดพลาดหรือนับซ้ำ - จำกัดค่าไม่ให้เกิน 50
@@ -940,12 +1043,46 @@ def write_window(csv_path, win_start, win_end, counts, frames_processed, tz, not
         "hour": hour
     }
     
-    # บันทึกลง CSV
-    df = pd.DataFrame([row])
-    hdr = not os.path.exists(csv_path)
-    df.to_csv(csv_path, mode="a", header=hdr, index=False)
+    # Debug: แสดงข้อมูลที่จะเขียนลง CSV
+    print(f"[csv] Writing row to CSV: {row}")
     
-    print(f"[{dt.strftime('%H:%M')}] {os.path.basename(csv_path)} +1 row (vehicle_count={vehicle_count}, single count for 5-min window)")
+    # บันทึกลง CSV พร้อมล็อคไฟล์เพื่อป้องกันการเขียนซ้ำจากหลายโปรเซส
+    try:
+        df = pd.DataFrame([row])
+        hdr = not os.path.exists(csv_path)
+        
+        # ใช้การเขียนแบบอะตอมิก (atomic write) เพื่อป้องกันการเสียหายของไฟล์
+        temp_path = csv_path + ".tmp"
+        
+        # ถ้าไฟล์ CSV มีอยู่แล้ว ให้โหลดข้อมูลเดิมก่อน
+        if os.path.exists(csv_path):
+            existing_df = pd.read_csv(csv_path)
+            # เพิ่มข้อมูลใหม่เข้าไป
+            combined_df = pd.concat([existing_df, df], ignore_index=True)
+        else:
+            combined_df = df
+        
+        # เขียนไฟล์ temporary
+        combined_df.to_csv(temp_path, index=False)
+        
+        # ย้ายไฟล์ temporary ไปแทนที่ไฟล์หลัก (atomic operation)
+        if os.path.exists(temp_path):
+            if os.path.exists(csv_path):
+                os.remove(csv_path)
+            os.rename(temp_path, csv_path)
+            
+        print(f"[{dt.strftime('%H:%M')}] {os.path.basename(csv_path)} +1 row (vehicle_count={vehicle_count}, timestamp={formatted_timestamp}) - SUCCESS")
+        
+    except Exception as e:
+        print(f"[csv] Error writing to CSV: {e}")
+        # ถ้าเขียนแบบ atomic ไม่ได้ ให้ลองเขียนแบบปกติ
+        try:
+            df = pd.DataFrame([row])
+            hdr = not os.path.exists(csv_path)
+            df.to_csv(csv_path, mode="a", header=hdr, index=False)
+            print(f"[{dt.strftime('%H:%M')}] {os.path.basename(csv_path)} +1 row (vehicle_count={vehicle_count}, timestamp={formatted_timestamp}) - FALLBACK SUCCESS")
+        except Exception as e2:
+            print(f"[csv] Failed to write CSV even with fallback method: {e2}")
 
 def save_snapshot(snapshot_path: str, frame):
     """
@@ -993,8 +1130,8 @@ def save_snapshot(snapshot_path: str, frame):
         
         # Draw timestamp on the image
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(frame_copy, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                   0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        # cv2.putText(frame_copy, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+        #            0.7, (0, 255, 0), 2, cv2.LINE_AA)
         
         # Write JPEG image with high quality (95%)
         ok = cv2.imwrite(snapshot_path, frame_copy, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
