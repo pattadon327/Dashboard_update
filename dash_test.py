@@ -22,7 +22,7 @@ st.set_page_config(
 def load_model():
     """Load the XGBoost model"""
     try:
-        with open('D:/eco_project/traffic_model_1h.pkl', 'rb') as f:
+        with open('D:/eco_project/Dashboard_update/traffic_model_1h.pkl', 'rb') as f:
             model = pickle.load(f)
         return model
     except Exception as e:
@@ -51,7 +51,7 @@ def create_sample_data_from_timestamp(timestamp_obj):
 def load_data():
     """Load the traffic training dataset"""
     try:
-        df = pd.read_csv('D:/eco_project/traffic_dataset1.csv')
+        df = pd.read_csv('D:/eco_project/Dashboard_update/traffic_dataset1.csv')
         df['timestamp'] = pd.to_datetime(df['timestamp'], format='%d/%m/%Y %H:%M')
         
         # Encode day_of_week to numeric for consistency
