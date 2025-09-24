@@ -1,0 +1,17 @@
+# Airflow requirements
+apache-airflow==2.7.3
+apache-airflow-providers-postgres==5.7.1
+
+# Traffic monitoring dependencies
+ultralytics
+opencv-python-headless
+pandas
+numpy
+pillow
+requests
+beautifulsoup4
+pytz
+streamlit
+
+# System dependencies
+psycopg2-binary
