@@ -2,8 +2,8 @@
   "timezone": "Asia/Bangkok",
   "cameras": [
     {
-      "name": "สะพานลอยใกล้ซอยสาทร 12 (ID996)",
-      "slug": "sathon12_footbridge_id996",
+      "name": "แยกสาทร-นราธิวาส (ID1748)",
+      "slug": "sathon12_footbridge_id1748",
       "url": "http://www.bmatraffic.com/PlayVideo.aspx?ID=1748",
       "snapshot_url": "http://www.bmatraffic.com/show.aspx?image=1748",
       "headers": {
