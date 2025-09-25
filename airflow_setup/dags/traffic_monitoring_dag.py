@@ -34,7 +34,7 @@ def check_traffic_process():
         return False
 
 def start_traffic_monitoring():
-    """เริ่มต้น traffic monitoring process"""
+    """เริ่มต้น traffic monitoring process (lightweight version)"""
     try:
         dashboard_path = "/opt/airflow/dashboard/bmatraffic_yolo_pipeline/src"
         cameras_config = "/opt/airflow/dashboard/bmatraffic_yolo_pipeline/config/cameras.json"
@@ -44,15 +44,17 @@ def start_traffic_monitoring():
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(f"{output_dir}/snapshots", exist_ok=True)
         
-        # เริ่มต้น traffic monitoring
+        print("🚦 Starting lightweight traffic monitoring...")
+        
+        # เริ่มต้น traffic monitoring (ปรับพารามิเตอร์ให้เบา)
         cmd = [
             'python', 
             f'{dashboard_path}/stream_to_counts.py',
             '--cameras', cameras_config,
-            '--bin_minutes', '5',
-            '--frame_step_sec', '2',
+            '--bin_minutes', '10',  # เพิ่มเป็น 10 นาที (เบากว่า)
+            '--frame_step_sec', '5',  # ประมวลผลทุก 5 วินาที (เบากว่า)
             '--out_dir', output_dir,
-            '--model', f'{dashboard_path}/../yolov8n.pt'
+            '--model', f'{dashboard_path}/yolov8n.pt'  # ใช้โมเดล nano (เบาที่สุด)
         ]
         
         print(f"Starting traffic monitoring with command: {' '.join(cmd)}")
@@ -126,7 +128,7 @@ dag = DAG(
     'traffic_monitoring_pipeline',
     default_args=default_args,
     description='Traffic Monitoring with YOLO Detection Pipeline',
-    schedule_interval=timedelta(hours=1),  # รันทุกชั่วโมงเพื่อตรวจสอบ
+    schedule_interval=timedelta(hours=2),  # รันทุก 2 ชั่วโมงเพื่อประหยัดทรัพยากร
     catchup=False,
     max_active_runs=1,
 )
