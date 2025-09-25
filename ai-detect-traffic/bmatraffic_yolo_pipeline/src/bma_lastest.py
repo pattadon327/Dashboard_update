@@ -1,0 +1,1389 @@
+import argparse, os, json, time, traceback, cv2, pandas as pd, numpy as np, re, requests
+from io import BytesIO
+from PIL import Image
+from datetime import datetime, timedelta
+from typing import Optional
+from ultralytics import YOLO
+from utils import align_to_window, class_filter_map, now_local, slugify, get_lag_values
+from urllib.parse import urljoin, urlparse, parse_qs
+import cv2, numpy as np, requests
+
+# เก็บเฉพาะถนนฝั่งขวา
+ROI_RIGHT_INCLUDE_NORM = [
+    (0.45, 0.15),  # บนซ้ายของฝั่งขวา (ร่นซ้ายเล็กน้อยเพื่อให้ center ของรถเข้า ROI ง่ายขึ้น)
+    (0.80, 0.15),  # บนขวา
+    (1.00, 1.00),  # ล่างขวา
+    (0.10, 1.00),  # ล่างซ้ายของฝั่งขวา
+]
+
+
+def norm_to_abs_points(norm_pts, w, h):
+    def clamp(v, lo, hi): 
+        return max(lo, min(int(round(v)), hi))
+    pts = []
+    for (x, y) in norm_pts:
+        px = clamp(x * (w - 1), 0, w - 1)
+        py = clamp(y * (h - 1), 0, h - 1)
+        pts.append((px, py))
+    return np.array(pts, dtype=np.int32)
+
+
+def apply_polygon_mask(frame, poly_pts_abs, *, exclude=False):
+    """
+    exclude=False (default)  : เก็บเฉพาะ 'ใน' polygon
+    exclude=True             : ตัดทิ้ง 'ใน' polygon (เก็บเฉพาะนอก polygon)
+    """
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    if exclude:
+        # ตัด polygon ทิ้ง ⇒ ด้านใน = 0, ด้านนอก = 255
+        cv2.fillPoly(mask, [poly_pts_abs], 0)
+        mask[mask == 0] = 0
+        mask[mask == 255] = 255
+        # เติมพื้นหลังเป็น 255 ก่อนแล้วค่อยทับ polygon ด้วย 0
+        mask[:] = 255
+        cv2.fillPoly(mask, [poly_pts_abs], 0)
+    else:
+        cv2.fillPoly(mask, [poly_pts_abs], 255)
+
+    roi = cv2.bitwise_and(frame, frame, mask=mask)
+    return roi, mask
+
+
+
+
+
+def enhance_image_for_detection(image):
+    """
+    ปรับปรุงภาพให้เหมาะสำหรับการตรวจจับรถ โดยเฉพาะในเวลากลางคืน
+    ใช้ adaptive histogram equalization และปรับ contrast/brightness อัตโนมัติ
+    """
+    if image is None or image.size == 0:
+        return image
+    
+    # สำเนาภาพต้นฉบับ
+    enhanced = image.copy()
+    
+    # ตรวจสอบความสว่างโดยรวมของภาพ
+    gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+    mean_brightness = np.mean(gray)
+    
+    # ถ้าภาพมืดมาก (กลางคืน) ให้ปรับปรุงแสง
+    if mean_brightness < 80:  # ค่าความสว่างต่ำ = กลางคืน
+        print(f"[enhance] Dark image detected (brightness: {mean_brightness:.1f}), applying night enhancement")
+        
+        # 1. ใช้ CLAHE (Contrast Limited Adaptive Histogram Equalization) เพื่อเพิ่ม contrast
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        
+        # แยกช่องสี BGR
+        b, g, r = cv2.split(enhanced)
+        
+        # ใช้ CLAHE กับแต่ละช่องสี
+        b_enhanced = clahe.apply(b)
+        g_enhanced = clahe.apply(g)
+        r_enhanced = clahe.apply(r)
+        
+        # รวมช่องสีกลับเข้าด้วยกัน
+        enhanced = cv2.merge([b_enhanced, g_enhanced, r_enhanced])
+        
+        # 2. ปรับ gamma เพื่อเพิ่มความสว่างในพื้นที่มืด
+        gamma = 1.2  # ค่า gamma > 1 จะทำให้ภาพสว่างขึ้น
+        inv_gamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+        enhanced = cv2.LUT(enhanced, table)
+        
+        # 3. ปรับ brightness และ contrast เล็กน้อย
+        alpha = 1.15  # contrast multiplier (> 1 เพิ่ม contrast)
+        beta = 15     # brightness addition
+        enhanced = cv2.convertScaleAbs(enhanced, alpha=alpha, beta=beta)
+        
+    elif mean_brightness > 200:  # ภาพสว่างมาก (อาจเป็นภาพขาวหรือแสงจ้า)
+        print(f"[enhance] Very bright image detected (brightness: {mean_brightness:.1f}), applying bright enhancement")
+        
+        # ลด brightness และเพิ่ม contrast เล็กน้อย
+        alpha = 1.1   # เพิ่ม contrast เล็กน้อย
+        beta = -10    # ลด brightness
+        enhanced = cv2.convertScaleAbs(enhanced, alpha=alpha, beta=beta)
+        
+    elif mean_brightness < 120:  # ภาพค่อนข้างมืด (เช่น เย็น/เช้า)
+        print(f"[enhance] Medium dark image detected (brightness: {mean_brightness:.1f}), applying moderate enhancement")
+        
+        # ใช้ CLAHE แบบอ่อนๆ
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = clahe.apply(l)
+        enhanced = cv2.merge([l, a, b])
+        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        
+        # ปรับ brightness เล็กน้อย
+        alpha = 1.05
+        beta = 10
+        enhanced = cv2.convertScaleAbs(enhanced, alpha=alpha, beta=beta)
+    else:
+        # ภาพมีความสว่างปกติ (กลางวัน) ไม่ต้องปรับ
+        print(f"[enhance] Normal brightness image (brightness: {mean_brightness:.1f}), no enhancement needed")
+    
+    return enhanced
+
+def detect_lighting_condition(image):
+    """
+    ตรวจสอบสภาพแสงของภาพ
+    return: 'night', 'dawn_dusk', 'day', 'bright'
+    """
+    if image is None or image.size == 0:
+        return 'unknown'
+    
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mean_brightness = np.mean(gray)
+    std_brightness = np.std(gray)
+    
+    # วิเคราะห์สภาพแสง
+    if mean_brightness < 60:
+        return 'night'
+    elif mean_brightness < 120:
+        return 'dawn_dusk'
+    elif mean_brightness > 200:
+        return 'bright'
+    else:
+        return 'day'
+
+def resolve_stream_url(url: str, headers=None):
+    """
+    If the URL is a direct media stream (.m3u8, .mp4), return as is.
+    If it's an HTML page (e.g., BMATraffic PlayVideo.aspx?ID=...), fetch and parse for an HLS/MP4 source.
+    """
+    headers = headers or {"User-Agent": "Mozilla/5.0 (compatible; TrafficCounter/1.0)"}
+    lower = url.lower()
+    if lower.endswith(".mp4") or ".m3u8" in lower:
+        return url
+
+    try:
+        from bs4 import BeautifulSoup
+
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Try common tags on the page
+        for tag in soup.find_all(["source", "video"]):
+            src_attr = tag.get("src") or tag.get("data-src")
+            if not src_attr:
+                continue
+            full = urljoin(url, src_attr)
+            if ".m3u8" in full or full.lower().endswith(".mp4"):
+                return full
+
+        # Try finding m3u8 in scripts/text
+        m = re.search(r'(https?://[^"\']+\.m3u8[^"\']*)', r.text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+        # Try to find ShowImage/ShowImageMark URLs inside inline scripts/HTML
+        snap_inline = find_snapshot_in_text(r.text, url)
+        if snap_inline:
+            return snap_inline
+
+        # Try <img> tags that often point to snapshot endpoints
+        for img in soup.find_all("img"):
+            src_attr = img.get("src") or img.get("data-src")
+            if not src_attr:
+                continue
+            full = urljoin(url, src_attr)
+            if is_image_like_url(full):
+                return full
+
+        # Follow iframes and repeat search inside
+        for ifr in soup.find_all("iframe"):
+            src = ifr.get("src")
+            if not src:
+                continue
+            iframe_url = urljoin(url, src)
+            try:
+                r2 = requests.get(iframe_url, headers=headers, timeout=15)
+                r2.raise_for_status()
+                s2 = BeautifulSoup(r2.text, "html.parser")
+                # search inside iframe for sources
+                for tag in s2.find_all(["source", "video"]):
+                    src2 = tag.get("src") or tag.get("data-src")
+                    if not src2:
+                        continue
+                    full2 = urljoin(iframe_url, src2)
+                    if ".m3u8" in full2 or full2.lower().endswith(".mp4"):
+                        return full2
+                m2 = re.search(r'(https?://[^"\']+\.m3u8[^"\']*)', r2.text, flags=re.IGNORECASE)
+                if m2:
+                    return m2.group(1)
+                # Also check <img> inside iframe
+                for img in s2.find_all("img"):
+                    src2 = img.get("src") or img.get("data-src")
+                    if not src2:
+                        continue
+                    full2 = urljoin(iframe_url, src2)
+                    if is_image_like_url(full2):
+                        return full2
+                # And check inline scripts inside iframe for snapshot endpoints
+                snap2 = find_snapshot_in_text(r2.text, iframe_url)
+                if snap2:
+                    return snap2
+            except Exception:
+                continue
+
+        # Heuristic fallback: PlayVideo.aspx?ID=xxxx -> try known snapshot endpoints
+        if "playvideo.aspx" in lower:
+            guess = guess_snapshot_from_id(url, headers)
+            if guess:
+                return guess
+
+    except Exception:
+        pass
+
+    # Fallback: return original (OpenCV may fail if not a direct stream)
+    return url
+
+
+# กำหนดประเภทยานพาหนะที่ต้องการนับ (ต้องตรงกับ VEHICLE_CLASS_NAMES ใน utils.py)
+# COCO dataset class IDs: 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck  
+SUPPORTED = {"bicycle", "car", "motorcycle", "bus", "truck"}
+
+def open_stream(url: str):
+    cap = cv2.VideoCapture(url)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open stream: {url}")
+    return cap
+
+def is_image_like_url(url: str) -> bool:
+    lower = url.lower()
+    if any(lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png")):
+        return True
+    # Many BMATraffic endpoints like show.aspx?image=996 or ShowImageMark.aspx
+    if "show.aspx" in lower and "image=" in lower:
+        return True
+    if "showimagemark.aspx" in lower:
+        return True
+    return False
+
+def derive_bma_referer(u: str) -> str:
+    """
+    If URL is a snapshot like show.aspx?image=996, derive the PlayVideo.aspx?ID=996
+    to use as Referer. Otherwise, return the input URL.
+    """
+    try:
+        lower = u.lower()
+        if "show.aspx" in lower and ("image=" in lower or "id=" in lower):
+            q = parse_qs(urlparse(u).query)
+            cam_id = None
+            for key in ("image", "id", "camera", "cameraid", "cam", "camid"):
+                v = q.get(key)
+                if v:
+                    cam_id = v[0]
+                    break
+            if cam_id:
+                return f"http://www.bmatraffic.com/PlayVideo.aspx?ID={cam_id}"
+    except Exception:
+        pass
+    return u
+
+def find_snapshot_in_text(html_text: str, base_url: str) -> Optional[str]:
+    # Look for common BMATraffic snapshot endpoints in inline code
+    patterns = [
+        r'(["\'])(?P<u>ShowImageMark\.aspx[^"\']*)\1',
+        r'(["\'])(?P<u>ShowImage\.aspx[^"\']*)\1',
+        r'(["\'])(?P<u>show\.aspx\?image=[^"\']+)\1',
+    ]
+    for p in patterns:
+        m = re.search(p, html_text, flags=re.IGNORECASE)
+        if m:
+            rel = m.group('u')
+            return urljoin(base_url, rel)
+    return None
+
+def guess_snapshot_from_id(page_url: str, headers=None) -> Optional[str]:
+    try:
+        q = parse_qs(urlparse(page_url).query)
+        cam_id = None
+        for k, v in q.items():
+            if k.lower() in ("id", "cam", "camid", "camera", "cameraid") and v:
+                cam_id = v[0]
+                break
+        if not cam_id:
+            return None
+        candidates = [
+            f"http://www.bmatraffic.com/ShowImageMark.aspx?ID={cam_id}",
+            f"http://www.bmatraffic.com/ShowImageMark.aspx?id={cam_id}",
+            f"http://www.bmatraffic.com/ShowImage.aspx?image={cam_id}",
+            f"http://www.bmatraffic.com/show.aspx?image={cam_id}",
+        ]
+        headers = headers or {"User-Agent": "Mozilla/5.0 (compatible; TrafficCounter/1.0)", "Referer": page_url}
+        for u in candidates:
+            try:
+                r = requests.get(u, headers=headers, timeout=10)
+                if r.status_code == 200:
+                    ct = r.headers.get("Content-Type", "").lower()
+                    if "image" in ct or is_image_like_url(u):
+                        return u
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+def fetch_snapshot_frame(url: str, headers=None, session=None):
+    """ดึงภาพจาก endpoint ที่เป็น snapshot (show.aspx, ShowImageMark.aspx, ไฟล์ภาพโดยตรง)"""
+    # ต้องส่ง header พิเศษสำหรับ BMATraffic ที่ต้องการ Referer และ User-Agent เหมือนเบราว์เซอร์จริง
+    full_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "th,en;q=0.9,en-US;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    
+    # รวม headers จากพารามิเตอร์
+    if headers:
+        full_headers.update(headers)
+        
+    # แสดง headers ที่กำลังใช้ (สำหรับ debug)
+    print(f"[debug] Fetching {url} with headers: {full_headers}")
+    
+    # ถ้า url เป็น PlayVideo.aspx, แปลงเป็น show.aspx?image=ID
+    if "playvideo.aspx" in url.lower() and "id=" in url.lower():
+        try:
+            q = parse_qs(urlparse(url).query)
+            cam_id = q.get("id", [None])[0] or q.get("ID", [None])[0]
+            if cam_id:
+                url = f"http://www.bmatraffic.com/show.aspx?image={cam_id}"
+        except Exception:
+            pass
+            
+    # เติมพารามิเตอร์ time=<epoch_ms> เพื่อกันแคช ตามรูปแบบของ BMA
+    sep = "&" if "?" in url else "?"
+    epoch_ms = int(time.time() * 1000)
+    fetch_url = f"{url}{sep}time={epoch_ms}"
+    # กันกรณีมี '&&' ซ้อน
+    fetch_url = fetch_url.replace("&&", "&")
+    
+    # ถ้าเป็น ShowImageMark หรือ show.aspx, เตรียม referer ให้ถูกต้อง
+    if "show" in fetch_url.lower() and "image=" in fetch_url.lower():
+        try:
+            q = parse_qs(urlparse(fetch_url).query)
+            cam_id = q.get("image", [None])[0]
+            if cam_id:
+                full_headers["Referer"] = f"http://www.bmatraffic.com/PlayVideo.aspx?ID={cam_id}"
+        except Exception:
+            pass
+    
+    # ถ้าเป็นไฟล์ภาพโดยตรงจาก BMATraffic ให้เตรียม referer จาก URL
+    if "bmatraffic.com" in fetch_url.lower() and ("/images/" in fetch_url.lower()):
+        try:
+            # ดึง camera ID จาก URL ของรูปภาพ (เช่น /images/traffic/996.jpg)
+            parts = fetch_url.split("/")
+            filename = parts[-1]  # เช่น 996.jpg
+            cam_id = filename.split(".")[0]  # เช่น 996
+            if cam_id.isdigit():
+                full_headers["Referer"] = f"http://www.bmatraffic.com/PlayVideo.aspx?ID={cam_id}"
+        except Exception:
+            pass
+    
+    # ใช้ session ถ้ามี มิฉะนั้นใช้ requests ธรรมดา
+    req = session.get if session else requests.get
+    
+    # พิเศษสำหรับ BMA Traffic ให้เพิ่ม Cache Buster ทุกครั้ง
+    if "bmatraffic.com" in url:
+        sep = "&" if "?" in fetch_url else "?"
+        timestamp = int(time.time() * 1000)
+        fetch_url = f"{fetch_url.split('?')[0]}?image={url.split('=')[-1]}&dummy={timestamp}"
+    
+    print(f"[debug] Final fetch URL: {fetch_url}")
+    print(f"[debug] Headers: {full_headers}")
+    
+    # สร้างรายการ URLs ที่จะลอง (เพิ่มความหลากหลาย)
+    urls_to_try = [fetch_url]
+    
+    # ถ้าเป็น BMATraffic เตรียม URLs สำรองเพิ่มเติม
+    if "bmatraffic.com" in url:
+        try:
+            cam_id = None
+            # ลองดึง camera ID จาก URL
+            if "show.aspx" in url.lower() and "image=" in url.lower():
+                q = parse_qs(urlparse(url).query)
+                cam_id = q.get("image", [None])[0]
+            elif "playvideo.aspx" in url.lower() and "id=" in url.lower():
+                q = parse_qs(urlparse(url).query)
+                cam_id = q.get("id", [None])[0] or q.get("ID", [None])[0]
+                
+            if cam_id:
+                timestamp = int(time.time() * 1000)
+                # เพิ่ม URLs ที่แตกต่างกัน
+                urls_to_try.extend([
+                    f"http://www.bmatraffic.com/show.aspx?image={cam_id}&dummy={timestamp}",
+                    f"http://www.bmatraffic.com/ShowImageMark.aspx?ID={cam_id}&dummy={timestamp}",
+                    f"http://www.bmatraffic.com/ShowImage.aspx?image={cam_id}&dummy={timestamp}",
+                ])
+        except Exception:
+            pass
+    
+    # ทำการเรียก URL - ลองทุก URL ในรายการจนกว่าจะสำเร็จ
+    response = None
+    last_error = None
+    
+    for try_url in urls_to_try:
+        try:
+            print(f"[fetch] Trying URL: {try_url}")
+            r = req(try_url, headers=full_headers, timeout=10)
+            r.raise_for_status()
+            
+            # ถ้าได้รับ response ที่สมบูรณ์ ให้ใช้ response นี้
+            if r.content and len(r.content) > 1000 and "image" in r.headers.get("Content-Type", "").lower():
+                response = r
+                print(f"[fetch] Success with URL: {try_url}")
+                break
+                
+            # ถ้าไม่ใช่รูปภาพหรือรูปภาพมีขนาดเล็กเกินไป
+            print(f"[fetch] URL returned non-image or small content: {try_url}, size={len(r.content)}, type={r.headers.get('Content-Type')}")
+            last_error = f"Content is not an image or too small: {r.headers.get('Content-Type')}"
+            
+        except Exception as e:
+            print(f"[fetch] Error with URL {try_url}: {e}")
+            last_error = str(e)
+    
+    # ถ้าไม่มี URL ใดสำเร็จ
+    if not response:
+        raise RuntimeError(f"All URLs failed: {last_error}")
+        
+    # ใช้ response ที่สำเร็จ
+    r = response
+    
+    # ตรวจสอบ Content-Type ว่าเป็นรูปภาพหรือไม่
+    ct = r.headers.get("Content-Type", "")
+    print(f"[debug] Response content type: {ct}")
+    
+    # ถ้าเป็น text/html แต่ขนาดเล็ก อาจจะเป็นหน้า error
+    if "image" not in ct.lower():
+        print(f"[warning] Content is not an image: {ct}")
+        print(f"[debug] Response size: {len(r.content)} bytes")
+        print(f"[debug] First 120 bytes: {r.content[:120]!r}")
+        
+        # ถ้าเป็น BMATraffic, ลอง URL อื่นๆ
+        if "bmatraffic.com" in url:
+            try:
+                cam_id = None
+                # ดึง camera ID จาก URL
+                if "show.aspx" in url.lower() and "image=" in url.lower():
+                    q = parse_qs(urlparse(url).query)
+                    cam_id = q.get("image", [None])[0]
+                elif "playvideo.aspx" in url.lower() and "id=" in url.lower():
+                    q = parse_qs(urlparse(url).query)
+                    cam_id = q.get("id", [None])[0] or q.get("ID", [None])[0]
+                
+                if cam_id:
+                    # ลอง URL แบบใหม่
+                    # แสดงให้เห็นถึงการปรับ URL และ headers
+                    print(f"[retry] Original URL failed, trying with new approach for camera ID {cam_id}")
+                    alt_url = f"http://www.bmatraffic.com/show.aspx?image={cam_id}&dummy={timestamp}"
+                    print(f"[retry] Trying alternative URL: {alt_url}")
+                    
+                    # เก็บ cookies จากการเรียกก่อนหน้า
+                    if "Set-Cookie" in r.headers:
+                        cookies = r.headers.get("Set-Cookie")
+                        full_headers["Cookie"] = cookies
+                        print(f"[retry] Using cookies from previous response: {cookies}")
+                    
+                    # เรียก URL ใหม่
+                    r_new = req(alt_url, headers=full_headers, timeout=10)
+                    if r_new.status_code == 200 and "image" in r_new.headers.get("Content-Type", "").lower():
+                        r = r_new  # ใช้ response ใหม่แทน
+                        print(f"[retry] Success with alternative URL: {alt_url}")
+                        print(f"[retry] New content type: {r.headers.get('Content-Type')}")
+                    else:
+                        print(f"[retry] Alternative URL failed: status={r_new.status_code}, ct={r_new.headers.get('Content-Type', '')}")
+            except Exception as e:
+                print(f"[retry] Error trying alternative URL: {e}")
+    
+    # ลอง decode ด้วย OpenCV ก่อน
+    data = np.frombuffer(r.content, dtype=np.uint8)
+    frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    
+    # ถ้า OpenCV ไม่สามารถ decode ได้ ลอง Pillow (เช่น กรณี WebP)
+    if frame is None:
+        try:
+            img = Image.open(BytesIO(r.content)).convert("RGB")
+            frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        except Exception:
+            pass
+            
+    if frame is None:
+        raise RuntimeError("Failed to decode snapshot image")
+    return frame
+
+
+def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data", tz="Asia/Bangkok", display=False):
+    """
+    ฟังก์ชันหลักสำหรับการประมวลผลวิดีโอจากกล้อง
+    
+    การทำงาน:
+    1. แบ่งเวลาเป็นหน้าต่างขนาด 5 นาที (หรือตามที่กำหนดใน bin_minutes)
+    2. ในแต่ละหน้าต่างเวลา จะดึงภาพและนับรถเพียงครั้งเดียวเท่านั้น (ไม่สะสมจากหลายเฟรม)
+    3. บันทึกภาพ snapshot ล่าสุดที่ใช้ในการนับรถ (1 รูปต่อหน้าต่างเวลา)
+    4. บันทึกข้อมูลการนับลงในไฟล์ CSV ในรูปแบบที่เหมาะกับ Time Series Forecasting
+    
+    Parameters:
+    - camera: ข้อมูลกล้อง (dict) จากไฟล์ cameras.json
+    - model: โมเดล YOLO ที่โหลดแล้ว (YOLOv8)
+    - bin_minutes: ช่วงเวลาในการรวบรวมข้อมูล (นาที) สำหรับการนับรถ
+    - frame_step_sec: ความถี่ในการดึง frame (วินาที) เพื่อควบคุมการใช้ทรัพยากร
+    - out_dir: โฟลเดอร์สำหรับบันทึกไฟล์ CSV และรูปภาพ
+    - tz: timezone
+    - display: แสดงภาพขณะประมวลผลหรือไม่ (สำหรับ debug)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    snapshot_dir = os.path.join(out_dir, "snapshots")
+    os.makedirs(snapshot_dir, exist_ok=True)
+    cam_name = camera.get("name") or camera.get("slug") or "camera"
+    cam_slug = camera.get("slug") or slugify(cam_name)
+    original_url = camera["url"]
+    snapshot_url = camera.get("snapshot_url")
+    headers = camera.get("headers", {})
+
+    if snapshot_url:
+        url = snapshot_url
+        snapshot_mode = True
+        print(f"[resolver] Using snapshot_url for {camera.get('name')} -> {url}")
+    else:
+        url = resolve_stream_url(original_url)
+        snapshot_mode = is_image_like_url(url)
+        if snapshot_mode:
+            print(f"[resolver] Using snapshot mode for {camera.get('name')} -> {url}")
+        else:
+            print(f"[resolver] Using video mode for {camera.get('name')} -> {url}")
+
+    # ใช้ PlayVideo.aspx?ID=... เป็น Referer
+    referer_url = derive_bma_referer(original_url if snapshot_mode else url)
+    if "Referer" not in headers and snapshot_mode:
+        headers["Referer"] = referer_url
+    
+    if snapshot_mode:
+        print(f"[resolver] Using Referer: {headers.get('Referer', referer_url)}")
+        
+    # ต้องสร้าง session ใหม่สำหรับทุก reconnect ด้วย
+    print("[resolver] Will create a new session for each connection attempt")
+
+    csv_path = os.path.join(out_dir, f"{cam_slug}_{bin_minutes}min.csv")
+    snapshot_path = os.path.join(snapshot_dir, f"{cam_slug}.jpg")
+
+    # counters within current 5-min window
+    win_start, win_end = None, None
+    counts = {k: 0 for k in SUPPORTED}  # จะถูกรีเซ็ตเมื่อเริ่มหน้าต่างเวลาใหม่
+    frames_processed = 0
+    last_write = time.time()
+    last_snapshot_window_start = None
+    vehicle_counted_for_window = False  # เพิ่มตัวแปรเพื่อติดตามว่าได้นับรถในหน้าต่างเวลานี้ไปแล้วหรือยัง
+
+    id2name = class_filter_map(model)
+
+    while True:
+        try:
+            cap = None
+            session = None
+            if not snapshot_mode:
+                cap = open_stream(url)
+            else:
+                # Prepare a session to carry cookies from the original page (helps bypass anti-hotlink)
+                session = requests.Session()
+                try:
+                    # สร้าง session และ เข้าหน้าหลัก + หน้า PlayVideo ก่อนเพื่อให้ได้ cookies ที่ถูกต้อง
+                    main_page_headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                        "Accept-Language": "th,en;q=0.9,en-US;q=0.8",
+                    }
+                    # เข้าหน้าหลักก่อน
+                    print("[session] Visiting BMATraffic homepage to establish session...")
+                    session.get("http://www.bmatraffic.com/", headers=main_page_headers, timeout=10)
+                    # เข้าหน้า PlayVideo
+                    print(f"[session] Visiting {referer_url} to get cookies...")
+                    session.get(referer_url, headers=main_page_headers, timeout=10)
+                    
+                    # แสดง cookies ที่ได้
+                    cookies_str = '; '.join([f"{c.name}={c.value}" for c in session.cookies])
+                    print(f"[session] Session established with cookies: {cookies_str}")
+                except Exception as e:
+                    print(f"[session] Error establishing session: {e}")
+            while True:
+                # Wait frame_step_sec between frames to control compute
+                time.sleep(frame_step_sec)
+                
+                # ลดความถี่ในการดึงเฟรมใหม่สำหรับการนับรถ (ลดภาระ CPU)
+                # ให้ดึงเฟรมเพียงบางเฟรมเท่านั้นในแต่ละหน้าต่างเวลา (5 นาที)
+                # จะดึงเฟรมถี่ขึ้นเมื่อใกล้จะสิ้นสุดหน้าต่างเวลา หรือเมื่อเริ่มหน้าต่างใหม่
+                
+                time_left_in_window = (win_end - ts).total_seconds() if win_end else 0
+                
+                # เพิ่มความถี่ในการดึงเฟรมเมื่อใกล้จะจบหน้าต่างเวลาหรือเพิ่งเริ่มหน้าต่างใหม่
+                if time_left_in_window < 60 or frames_processed < 5:  # 1 นาทีสุดท้ายหรือ 5 เฟรมแรก
+                    # ดึงเฟรมตามปกติ
+                    pass
+                else:
+                    # ลดความถี่ในการดึงเฟรมลงในช่วงกลางของหน้าต่างเวลา
+                    extra_sleep = min(frame_step_sec * 4, 10)  # รอเพิ่มไม่เกิน 10 วินาที
+                    time.sleep(extra_sleep)
+                    print(f"[optimize] Reduced frame rate in mid-window (time left: {time_left_in_window:.1f}s)")
+                
+                if snapshot_mode:
+                    # Include Referer header pointing to the original page to bypass hotlink protections
+                    fetch_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
+                    # Add Referer and any custom headers from camera config
+                    fetch_headers.update(headers)
+                    if "Referer" not in fetch_headers:
+                        fetch_headers["Referer"] = referer_url
+                    # ถ้ามี cookies จาก session นำมาใส่ใน headers
+                    if session and session.cookies:
+                        cookies_str = '; '.join([f"{c.name}={c.value}" for c in session.cookies])
+                        fetch_headers["Cookie"] = cookies_str
+                    frame = fetch_snapshot_frame(url, headers=fetch_headers, session=session)
+                else:
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        raise RuntimeError("Stream read failed (frame is None). Reconnecting...")
+
+                ts = now_local(tz)
+
+                # Initialize window if needed
+                if win_start is None or ts >= win_end:
+                    # Window transition - prepare for next point-in-time detection
+                    if win_start is not None:
+                        print(f"[window] Transitioning from {win_start.strftime('%H:%M')} window to next 5-minute mark")
+                        # CSV already written during point-in-time detection, no need to write again
+                        
+                    # Reset for new window
+                    win_start, win_end = align_to_window(ts, bin_minutes, tz)
+                    print(f"[window] ===== NEW 5-MINUTE WINDOW =====")
+                    print(f"[window] Target time: {win_start.strftime('%H:%M')}")
+                    print(f"[window] Window range: {win_start.strftime('%H:%M')} - {win_end.strftime('%H:%M')}")
+                    print(f"[window] Will perform ONE point-in-time detection at {win_start.strftime('%H:%M')}")
+                    print(f"[window] ================================")
+                    counts = {k: 0 for k in SUPPORTED}  # รีเซ็ตการนับสำหรับหน้าต่างใหม่
+                    frames_processed = 0
+                    vehicle_counted_for_window = False  # รีเซ็ตตัวแปรบอกว่ายังไม่ได้นับรถในหน้าต่างเวลาใหม่นี้
+                    
+                # ตรวจสอบว่าเราได้นับรถในหน้าต่างเวลานี้ไปแล้วหรือยัง
+                # เราจะนับรถเพียงครั้งเดียวในแต่ละหน้าต่างเวลา 5 นาที (point-in-time detection)
+                if vehicle_counted_for_window:
+                    # ข้ามการประมวลผล YOLO เนื่องจากได้นับรถไปแล้วในหน้าต่างเวลานี้
+                    print(f"[skip] Already counted vehicles for window {win_start.strftime('%H:%M')} - waiting for next 5-minute mark")
+                    
+                    # หยุดการทำงานจนกว่าจะถึงหน้าต่างเวลาถัดไป
+                    time_until_next_window = (win_end - ts).total_seconds()
+                    if time_until_next_window > 30:  # ถ้าเหลือเวลามากกว่า 30 วินาที ให้หยุดรอ
+                        sleep_time = min(30, time_until_next_window - 10)  # รอแต่ไม่เกิน 30 วินาที
+                        print(f"[sleep] Waiting {sleep_time:.1f} seconds until next detection window")
+                        time.sleep(sleep_time)
+                    continue
+                else:
+                    # แสดงข้อความว่าเรากำลังจะนับรถในจุดเวลานี้
+                    print(f"[point-detection] Performing point-in-time detection for {win_start.strftime('%H:%M')}")
+                    print(f"[point-detection] This will be the ONLY detection for this 5-minute window")
+
+                # Check if frame is valid for YOLO
+                if frame is None or frame.size == 0:
+                    print("[warning] Skipping invalid frame for YOLO inference")
+                    continue
+                
+                # ตรวจสอบภาพและบันทึก snapshot ดิบสำหรับจุดเวลานี้ (point-in-time snapshot) ก่อนทำ YOLO
+                # จะบันทึกภาพเพียง 1 ครั้งต่อหน้าต่างเวลา 5 นาที เป็นตัวแทนของช่วงเวลานั้น
+                if last_snapshot_window_start != win_start:
+                    try:
+                        # บันทึกภาพต้นฉบับ (ไม่ใช่ภาพที่ปรับปรุงแล้ว) และตรวจสอบว่าเป็นภาพขาวหรือไม่
+                        is_valid_image = save_snapshot(snapshot_path + ".raw.jpg", frame)
+                        
+                        if is_valid_image:
+                            # ถ้าภาพสมบูรณ์ ให้บันทึกเวลาหน้าต่างและทำการนับต่อไป
+                            last_snapshot_window_start = win_start
+                            print(f"[point-snapshot] Raw snapshot saved for time point: {win_start.strftime('%Y-%m-%d %H:%M')}")
+                            print(f"[point-snapshot] This snapshot represents the exact 5-minute mark")
+                        else:
+                            # ถ้าภาพเป็นภาพขาว ให้ลองสร้าง session ใหม่
+                            print(f"[retry] Blank image detected at time point {win_start.strftime('%H:%M')}, trying to reconnect...")
+                            
+                            # สร้าง session ใหม่เพื่อลองเชื่อมต่อใหม่
+                            if snapshot_mode and session:
+                                try:
+                                    # ปิด session เดิม
+                                    session.close()
+                                    # สร้าง session ใหม่
+                                    session = requests.Session()
+                                    # เข้าหน้าหลัก + หน้า PlayVideo อีกครั้ง
+                                    main_page_headers = {
+                                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                                        "Accept-Language": "th,en;q=0.9,en-US;q=0.8",
+                                    }
+                                    print("[session] Creating new session for better image quality...")
+                                    session.get("http://www.bmatraffic.com/", headers=main_page_headers, timeout=10)
+                                    session.get(referer_url, headers=main_page_headers, timeout=10)
+                                    # แสดง cookies ที่ได้
+                                    cookies_str = '; '.join([f"{c.name}={c.value}" for c in session.cookies])
+                                    print(f"[session] New session established with cookies: {cookies_str}")
+                                    
+                                    # ไม่ให้นับในหน้าต่างนี้ เพื่อลองใหม่ในเฟรมถัดไป
+                                    vehicle_counted_for_window = False
+                                    print(f"[retry] Will retry point-detection with new session")
+                                    
+                                    # ข้ามการประมวลผล YOLO ในรอบนี้
+                                    continue
+                                except Exception as e:
+                                    print(f"[session] Error refreshing session: {e}")
+                            
+                    except Exception as se:
+                        print(f"[point-snapshot] Error saving point-in-time snapshot: {se}")
+                        # ลองต่อไปแม้ snapshot จะบันทึกไม่ได้
+                        last_snapshot_window_start = win_start
+                
+                # โหลดภาพจากไฟล์ .raw.jpg ที่บันทึกไว้แล้วสำหรับ YOLO detection
+                # เพื่อให้ได้ผลลัพธ์ที่สอดคล้องกันระหว่างรูปดิบและรูปที่มีการวาด
+                yolo_frame = None
+                raw_image_path = snapshot_path + ".raw.jpg"
+                
+                if os.path.exists(raw_image_path):
+                    try:
+                        # โหลดภาพจากไฟล์ที่บันทึกไว้
+                        yolo_frame = cv2.imread(raw_image_path)
+                        if yolo_frame is not None:
+                            print(f"[yolo-input] Using saved raw image for detection: {raw_image_path}")
+                            print(f"[yolo-input] Raw image shape: {yolo_frame.shape}")
+                        else:
+                            print(f"[yolo-input] Failed to load raw image, using current frame")
+                            yolo_frame = frame
+                    except Exception as e:
+                        print(f"[yolo-input] Error loading raw image: {e}, using current frame")
+                        yolo_frame = frame
+                else:
+                    print(f"[yolo-input] Raw image file not found, using current frame")
+                    yolo_frame = frame
+                
+                # ตรวจสอบสภาพแสงและปรับปรุงภาพก่อนส่งเข้า YOLO (ใช้ yolo_frame)
+                lighting_condition = detect_lighting_condition(yolo_frame)
+                print(f"[lighting] Detected lighting condition: {lighting_condition}")
+                
+                # กำหนด confidence threshold ตามสภาพแสง
+                if lighting_condition == 'night':
+                    confidence_threshold = 0.05  # ลดลงสำหรับกลางคืนให้ไวขึ้น
+                elif lighting_condition == 'dawn_dusk':
+                    confidence_threshold = 0.12  # ค่ากลางสำหรับเวลาเช้า/เย็น
+                elif lighting_condition == 'bright':
+                    confidence_threshold = 0.20  # เพิ่มขึ้นสำหรับแสงจ้า (ลด false positive)
+                else:  # day
+                    confidence_threshold = 0.15  # ค่าปกติสำหรับกลางวัน
+                
+                print(f"[yolo] Using confidence threshold: {confidence_threshold:.2f} for {lighting_condition} conditions")
+                
+                # สร้างภาพที่ปรับปรุงแล้วสำหรับ YOLO จากภาพ raw ที่โหลดมา
+                enhanced_frame = enhance_image_for_detection(yolo_frame)
+                
+                # ตรวจสอบภาพและบันทึก snapshot ดิบสำหรับจุดเวลานี้ (point-in-time snapshot)
+                # จะบันทึกภาพเพียง 1 ครั้งต่อหน้าต่างเวลา 5 นาที เป็นตัวแทนของช่วงเวลานั้น
+                if last_snapshot_window_start != win_start:
+                    try:
+                        # บันทึกภาพต้นฉบับ (ไม่ใช่ภาพที่ปรับปรุงแล้ว) และตรวจสอบว่าเป็นภาพขาวหรือไม่
+                        is_valid_image = save_snapshot(snapshot_path + ".raw.jpg", frame)
+                        
+                        if is_valid_image:
+                            # ถ้าภาพสมบูรณ์ ให้บันทึกเวลาหน้าต่างและทำการนับต่อไป
+                            last_snapshot_window_start = win_start
+                            print(f"[point-snapshot] Raw snapshot saved for time point: {win_start.strftime('%Y-%m-%d %H:%M')}")
+                            print(f"[point-snapshot] This snapshot represents the exact 5-minute mark")
+                        else:
+                            # ถ้าภาพเป็นภาพขาว ให้ลองสร้าง session ใหม่
+                            print(f"[retry] Blank image detected at time point {win_start.strftime('%H:%M')}, trying to reconnect...")
+                            
+                            # สร้าง session ใหม่เพื่อลองเชื่อมต่อใหม่
+                            if snapshot_mode and session:
+                                try:
+                                    # ปิด session เดิม
+                                    session.close()
+                                    # สร้าง session ใหม่
+                                    session = requests.Session()
+                                    # เข้าหน้าหลัก + หน้า PlayVideo อีกครั้ง
+                                    main_page_headers = {
+                                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                                        "Accept-Language": "th,en;q=0.9,en-US;q=0.8",
+                                    }
+                                    print("[session] Creating new session for better image quality...")
+                                    session.get("http://www.bmatraffic.com/", headers=main_page_headers, timeout=10)
+                                    session.get(referer_url, headers=main_page_headers, timeout=10)
+                                    # แสดง cookies ที่ได้
+                                    cookies_str = '; '.join([f"{c.name}={c.value}" for c in session.cookies])
+                                    print(f"[session] New session established with cookies: {cookies_str}")
+                                    
+                                    # ไม่ให้นับในหน้าต่างนี้ เพื่อลองใหม่ในเฟรมถัดไป
+                                    vehicle_counted_for_window = False
+                                    print(f"[retry] Will retry point-detection with new session")
+                                    
+                                    # ข้ามการประมวลผล YOLO ในรอบนี้
+                                    continue
+                                except Exception as e:
+                                    print(f"[session] Error refreshing session: {e}")
+                            
+                    except Exception as se:
+                        print(f"[point-snapshot] Error saving point-in-time snapshot: {se}")
+                        # ลองต่อไปแม้ snapshot จะบันทึกไม่ได้
+                        last_snapshot_window_start = win_start
+                
+                # Draw rectangle for debug if display is enabled
+                if display:
+                    debug_frame = yolo_frame.copy()  # ใช้ภาพ raw ที่จะส่งเข้า YOLO
+                else:
+                    debug_frame = yolo_frame
+
+                h_img, w_img = enhanced_frame.shape[:2]
+                poly_pts_abs = norm_to_abs_points(ROI_RIGHT_INCLUDE_NORM, w_img, h_img)
+
+                # วาด ROI ให้เห็นชัดเจนขึ้น: เส้นสีเขียวหนา 2px เพื่อให้เห็นชัดเจนโดยไม่ต้องระบายสี
+                cv2.polylines(debug_frame, [poly_pts_abs], True, (0,0,255), 2)
+                
+                # เพิ่มข้อความที่พื้นที่ ROI
+                # cv2.putText(debug_frame, "ROI", 
+                        #    (poly_pts_abs[0][0] + 10, poly_pts_abs[0][1] + 30),
+                        #    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                # ทำ mask ให้ส่วนที่อยู่นอก polygon กลายเป็น 0
+                roi_frame, roi_mask = apply_polygon_mask(enhanced_frame, poly_pts_abs, exclude=False)
+                roi_coverage = (roi_mask > 0).mean()
+                print(f"[roi] coverage: {roi_coverage*100:.1f}%")
+                if roi_coverage < 2/100:
+                    print("[roi][warning] ROI area too small → detections may be zero")
+
+                # ฟังก์ชันช่วยเช็คว่า center หรือ bottom-center ของกล่องอยู่ใน ROI หรือไม่
+                def center_in_mask(x1, y1, x2, y2, m):
+                    cx, cy = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+                    if cx < 0 or cy < 0 or cy >= m.shape[0] or cx >= m.shape[1]:
+                        return False
+                    return m[cy, cx] > 0
+
+                def bottom_center_in_mask(x1, y1, x2, y2, m):
+                    cx, by = (int((x1 + x2) / 2), int(max(y1, y2)))
+                    by = min(max(by - 2, 0), m.shape[0] - 1)  # เลื่อนขึ้นเล็กน้อยจากขอบล่างของกล่อง
+                    if cx < 0 or by < 0 or by >= m.shape[0] or cx >= m.shape[1]:
+                        return False
+                    return m[by, cx] > 0
+                
+
+                # YOLO inference - ใช้ภาพที่ปรับปรุงแล้ว
+                # กำหนดค่าเริ่มต้นสำหรับการแสดงผล
+                all_detections = []
+                
+                try:
+                    print(f"[yolo] Running inference on enhanced frame: {enhanced_frame.shape} (lighting: {lighting_condition})")
+                    # กำหนด classes เฉพาะยานพาหนะ และส่งค่า conf แบบไดนามิกเข้าโมเดลเพื่อลดการกรองก่อนเวลาอันควร
+                    classes_of_interest = None
+                    # สร้าง classes_of_interest แบบปลอดภัย (fallback เป็น None = ไม่ส่งพารามิเตอร์)
+                    classes_of_interest = None
+                    try:
+                        if isinstance(model.names, dict):
+                            classes_of_interest = [i for i, n in model.names.items() if n in SUPPORTED]
+                        elif isinstance(model.names, (list, tuple)):
+                            classes_of_interest = [i for i, n in enumerate(model.names) if n in SUPPORTED]
+                        if not classes_of_interest:
+                            classes_of_interest = None
+                        print(f"[yolo] classes_of_interest: {classes_of_interest}")
+                    except Exception as e:
+                        print(f"[yolo] Could not derive classes_of_interest: {e}")
+                        classes_of_interest = None
+
+                    predict_kwargs = dict(
+                        source=enhanced_frame,
+                        verbose=False,
+                        device=0 if os.environ.get("YOLO_GPU", "").strip() else None,
+                        conf=confidence_threshold,
+                    )
+                    if classes_of_interest is not None:
+                        predict_kwargs["classes"] = classes_of_interest
+
+                    res = model.predict(**predict_kwargs)
+
+
+                    if not res:
+                        print("[yolo] No results from YOLO model")
+                        frames_processed += 1
+                        continue
+                        
+                    r0 = res[0]
+                    if r0.boxes is None or len(r0.boxes) == 0:  # no detections
+                        print("[yolo] No objects detected")
+                        
+                        # ถึงแม้ไม่มีการตรวจจับ ก็ยังต้องบันทึก CSV เป็น 0
+                        vehicle_counted_for_window = True
+                        
+                        # บันทึกข้อมูลลง CSV ทันทีหลังจาก detection (point-in-time recording) - กรณีไม่มีรถ
+                        print(f"[point-csv] Writing point-in-time data to CSV for {win_start.strftime('%H:%M')} - NO VEHICLES DETECTED")
+                        write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes="point_detection_no_vehicles")
+                        print(f"[point-csv] Point-in-time vehicle count: 0")
+                        print(f"[point-csv] Next detection will be at: {win_end.strftime('%H:%M')}")
+                        
+                        # บันทึกภาพที่แสดงจำนวนรถ 0
+                        try:
+                            h, w = debug_frame.shape[:2]
+                            current_time = win_start.strftime("%H:%M")
+                            
+                            # แสดงจำนวนรถ 0
+                            cv2.putText(debug_frame, "Vehicles: 0", (10, 30), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                            
+                            # แสดงเวลา (ไม่แสดงวันที่)
+                            cv2.putText(debug_frame, f"Time: {current_time}", (10, 70), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+                            # บันทึกภาพที่มีข้อมูลเพิ่มเติมแล้ว
+                            ok = cv2.imwrite(snapshot_path, debug_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                            if ok:
+                                print(f"[point-annotated] Successfully saved annotated image (no vehicles): {os.path.basename(snapshot_path)}")
+                            else:
+                                print(f"[point-annotated] Failed to save annotated image")
+                        except Exception as e:
+                            print(f"[point-annotated] Error saving annotated image: {e}")
+                        
+                        frames_processed += 1
+                        continue
+
+                    # Get valid detections
+                    cls_ids = r0.boxes.cls.tolist()
+                    confidence_scores = r0.boxes.conf.tolist()
+                    boxes = r0.boxes.xyxy.cpu().numpy()
+                    
+                    # Log confidence scores
+                    print(f"[yolo] Detected {len(cls_ids)} objects with confidence: {confidence_scores}")
+                    
+                    # กรองผลลัพธ์ด้วย confidence threshold ที่กำหนดไว้แล้ว
+                    confident_detections = [(int(cid), score, box) 
+                                          for cid, score, box in zip(cls_ids, confidence_scores, boxes) 
+                                          if score > confidence_threshold]
+                    print(f"[yolo] After threshold ({confidence_threshold}): {len(confident_detections)} valid detections")
+                    
+                    # ถ้ายังไม่พบอะไรเลย ลอง fallback: รันทับอีกครั้งแบบไม่จำกัดคลาสและลด conf ลง
+                    if len(confident_detections) == 0:
+                        try:
+                            print("[fallback] No detections after threshold. Retrying without class filter at conf=0.05…")
+                            res2 = model.predict(
+                                source=enhanced_frame,
+                                verbose=False,
+                                device=0 if os.environ.get("YOLO_GPU", "").strip() else None,
+                                conf=0.05,
+                            )
+                            if res2:
+                                r2 = res2[0]
+                                if r2.boxes is not None and len(r2.boxes) > 0:
+                                    cls_ids = r2.boxes.cls.tolist()
+                                    confidence_scores = r2.boxes.conf.tolist()
+                                    boxes = r2.boxes.xyxy.cpu().numpy()
+                                    print(f"[fallback] Detected {len(cls_ids)} objects with confidence: {confidence_scores}")
+                                    confident_detections = [
+                                        (int(cid), score, box)
+                                        for cid, score, box in zip(cls_ids, confidence_scores, boxes)
+                                        if score > 0.05
+                                    ]
+                                    print(f"[fallback] After threshold (0.05): {len(confident_detections)} valid detections")
+                        except Exception as _e:
+                            print(f"[fallback] Error retrying detection: {_e}")
+                    
+                    # แสดงกรอบก่อนกรอง ROI (เส้นสีเหลืองบาง) เพื่อช่วย debug ว่า YOLO เห็นอะไรบ้าง
+                    pre_roi_count = len(confident_detections)
+                    for cid_dbg, score_dbg, box_dbg in confident_detections:
+                        x1d, y1d, x2d, y2d = map(int, box_dbg)
+                        cv2.rectangle(debug_frame, (x1d, y1d), (x2d, y2d), (0, 255, 255), 1)
+                    print(f"[roi] Pre-ROI detections: {pre_roi_count}")
+
+                    # หลังสร้าง confident_detections ด้วย threshold แล้ว
+                    # กรองโดยใช้ ROI_RIGHT_INCLUDE_NORM - เก็บเฉพาะรถที่อยู่ในพื้นที่ที่สนใจ (กันซ้ำด้วย set)
+                    roi_detections = []
+                    seen = set()
+                    for cid, score, box in confident_detections:
+                        x1, y1, x2, y2 = map(int, box)
+                        keep = False
+                        if center_in_mask(x1, y1, x2, y2, roi_mask) or bottom_center_in_mask(x1, y1, x2, y2, roi_mask):
+                            keep = True
+                        else:
+                            sub = roi_mask[max(y1,0):min(y2,roi_mask.shape[0]), max(x1,0):min(x2,roi_mask.shape[1])]
+                            if sub.size:
+                                overlap_ratio = (sub > 0).mean()
+                                if overlap_ratio > 0.10:
+                                    keep = True
+                        if keep:
+                            key = (int(x1), int(y1), int(x2), int(y2), int(cid))
+                            if key not in seen:
+                                roi_detections.append((cid, score, box))
+                                seen.add(key)
+
+                    # ถ้าตรวจพบก่อนกรอง ROI แต่หลังกรองเหลือศูนย์ ให้ผ่อนปรนอีกเล็กน้อย
+                    if pre_roi_count > 0 and len(roi_detections) == 0:
+                        print("[roi] No detections passed ROI filter. Relaxing overlap to 0.02 as fallback…")
+                        for cid, score, box in confident_detections:
+                            x1, y1, x2, y2 = map(int, box)
+                            if center_in_mask(x1, y1, x2, y2, roi_mask) or bottom_center_in_mask(x1, y1, x2, y2, roi_mask):
+                                roi_detections.append((cid, score, box))
+                                continue
+                            sub = roi_mask[max(y1,0):min(y2,roi_mask.shape[0]), max(x1,0):min(x2,roi_mask.shape[1])]
+                            if sub.size == 0:
+                                continue
+                            overlap_ratio = (sub > 0).mean()
+                            if overlap_ratio > 0.02:
+                                roi_detections.append((cid, score, box))
+
+                    confident_detections = roi_detections
+                    print(f"[yolo] After RIGHT-INCLUDE filter: {len(confident_detections)} detections (right side only)")
+
+                    # นับรถทุกคันที่ตรวจพบในเฟรมนี้ (แค่ครั้งเดียวต่อหน้าต่างเวลา) โดยแยกตามประเภท
+                    vehicles_in_frame = {k: 0 for k in SUPPORTED}
+                    # กรองอีกชั้นด้วย ROI mask
+
+                    # Count vehicles by class
+                    all_detections = []  # เก็บข้อมูลทุกการตรวจจับไว้แสดงผล
+                    for cid, score, box in confident_detections:
+                        label = id2name.get(cid)
+                        # Debug: แสดงการแปลง class ID
+                        print(f"[debug] Class ID {cid} -> Label: {label} (confidence: {score:.2f})")
+                        
+                        # เก็บข้อมูลการตรวจจับทั้งหมด
+                        all_detections.append((cid, label or f"class_{cid}", score, box))
+                        
+                        if label and label in SUPPORTED:
+                            # เพิ่มค่าในประเภทของรถที่ตรวจพบในเฟรมนี้
+                            vehicles_in_frame[label] += 1
+                            # บันทึกลงในการนับรวมของหน้าต่างเวลานี้ (นับแค่ครั้งเดียว)
+                            counts[label] += 1
+                            print(f"[count] Added {label} to counts. Total {label}: {counts[label]}")
+                        else:
+                            print(f"[skip] Class ID {cid} (label: {label or 'None'}) not in SUPPORTED list: {SUPPORTED}")
+                    
+                    # แสดงการตรวจจับทั้งหมดที่พบ (ทั้งที่นับและไม่นับ)
+                    print(f"[yolo] All detections: {[(d[1], d[2]) for d in all_detections]}")
+                    print(f"[yolo] Current counts after processing: {counts}")
+                    print(f"[yolo] Current vehicles_in_frame: {vehicles_in_frame}")
+                    
+                    # เปลี่ยนสถานะเป็นได้นับรถในหน้าต่างเวลานี้แล้ว (จะไม่นับซ้ำอีก)
+                    vehicle_counted_for_window = True
+                    
+                    # บันทึกข้อมูลลง CSV ทันทีหลังจาก detection (point-in-time recording)
+                    print(f"[point-csv] Writing point-in-time data to CSV for {win_start.strftime('%H:%M')}")
+                    write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes="point_detection")
+                    print(f"[point-csv] Point-in-time vehicle count: {sum(counts.values())} | Details: {counts}")
+                    print(f"[point-csv] Next detection will be at: {win_end.strftime('%H:%M')}")
+                    
+                    # แสดงสรุปการทำงาน point-in-time
+                    print(f"[point-summary] ===== POINT-IN-TIME DETECTION COMPLETE =====")
+                    print(f"[point-summary] Time: {win_start.strftime('%Y-%m-%d %H:%M')}")
+                    print(f"[point-summary] Total vehicles detected: {sum(counts.values())}")
+                    print(f"[point-summary] Detection details: {counts}")
+                    print(f"[point-summary] Raw image: {os.path.basename(snapshot_path)}.raw.jpg")
+                    print(f"[point-summary] Annotated image: {os.path.basename(snapshot_path)}")
+                    print(f"[point-summary] ==============================================")
+                    
+                    # วาดการตรวจจับทั้งหมดบน debug frame (ทั้งในกรณี display และไม่ display)
+                    for obj_class_id, obj_label, obj_score, obj_box in all_detections:
+                        x1, y1, x2, y2 = obj_box
+                        
+                        # กำหนดสีต่างกันระหว่างวัตถุที่นับ (สีแดง) และไม่นับ (สีน้ำเงิน)
+                        # กำหนดสีกรอบตามประเภทยานพาหนะและตำแหน่ง (อยู่ใน ROI หรือไม่)
+                        is_in_roi = center_in_mask(x1, y1, x2, y2, roi_mask)
+                        
+                        # สีเขียว = ในพื้นที่ ROI และนับได้, สีแดง = นอก ROI หรือประเภทไม่ได้นับ
+                        if is_in_roi and obj_label in SUPPORTED:
+                            box_color = (0, 255, 0)  # สีเขียว - ในพื้นที่ ROI และเป็นยานพาหนะที่นับ
+                            thickness = 2
+                        else:
+                            box_color = (0, 0, 255) if obj_label in SUPPORTED else (255, 0, 0)  # สีแดงหรือน้ำเงิน - นอกพื้นที่
+                            thickness = 1  # เส้นบางกว่าสำหรับรถที่ไม่อยู่ใน ROI
+                        
+                        # วาดกรอบรถพร้อมระบุประเภท
+                        cv2.rectangle(debug_frame, 
+                                    (int(x1), int(y1)), 
+                                    (int(x2), int(y2)), 
+                                    box_color, thickness)
+                        
+                        # ไม่แสดงป้ายกำกับ class/เปอร์เซ็นต์ เหลือเฉพาะกรอบ bounding box
+                        # เดิม: putText ชื่อคลาสและคะแนนเหนือกรอบ
+                    
+                    # แสดงจำนวนรถที่พบในเฟรมนี้
+                    total_in_frame = sum(vehicles_in_frame.values())
+                    print(f"[yolo] Vehicles in current frame: {total_in_frame} {vehicles_in_frame}")
+                    
+                    # ไม่แสดงกล่องพื้นหลังสีดำมุมซ้ายบนอีกต่อไป (ลบ summary box)
+                    # เดิม: วาดกล่องสีดำและข้อความสรุปจำนวนรถตามคลาสที่มุมซ้ายบน
+                    # เหลือไว้เฉพาะข้อความ "Vehicles" และ "Time" สีเขียวที่ด้านล่างของบล็อกถัดไป
+                    
+                    # ไม่แสดงกล่องวันที่/เวลา (ลบ overlay มุมล่างขวา)
+                    
+                except Exception as e:
+                    print(f"[yolo] Error in YOLO inference: {e}")
+                    continue
+
+                frames_processed += 1
+
+                # ปรับปรุง debug_frame เพื่อแสดงข้อมูลที่จำเป็นเท่านั้น
+                h, w = debug_frame.shape[:2]
+                
+                # แสดงจำนวนรถรวมที่จับได้
+                total_vehicles = sum(counts.values())
+                cv2.putText(debug_frame, f"Vehicles: {total_vehicles}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                
+                # แสดงเวลา (ไม่แสดงวันที่)
+                current_time = win_start.strftime("%H:%M")
+                cv2.putText(debug_frame, f"Time: {current_time}", (10, 70), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                
+                # บันทึกภาพที่มีการวาดเพิ่มเติมแล้ว (point-in-time annotated image)
+                # บันทึกทันทีหลังจาก detection เสร็จ
+                if vehicle_counted_for_window and last_snapshot_window_start == win_start:
+                    try:
+                        print(f"[point-annotated] Saving annotated image for time point: {win_start.strftime('%H:%M')}")
+                        
+                        # บันทึกภาพที่มีข้อมูลเพิ่มเติมแล้ว
+                        ok = cv2.imwrite(snapshot_path, debug_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                        if ok:
+                            print(f"[point-annotated] Successfully saved annotated image: {os.path.basename(snapshot_path)}")
+                            print(f"[point-annotated] Image shows detection results for exactly {current_time}")
+                        else:
+                            print(f"[point-annotated] Failed to save annotated image")
+                    except Exception as e:
+                        print(f"[point-annotated] Error saving annotated image: {e}")
+                
+                if display:
+                    try:
+                        # แสดงผลบนหน้าจอ
+                        cv2.imshow(cam_slug, debug_frame)
+                        # Press 'q' to exit, reduce CPU usage with longer wait
+                        if cv2.waitKey(100) & 0xFF == ord('q'):
+                            raise KeyboardInterrupt()
+                    except Exception as e:
+                        print(f"[display] Error showing frame: {e}")
+
+        except KeyboardInterrupt:
+            # Flush and exit - only write if we haven't written for current window yet
+            if win_start is not None and not vehicle_counted_for_window:
+                print(f"[exit] Writing final data for incomplete window: {win_start.strftime('%H:%M')}")
+                write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes="user_interrupt")
+            print("Stopped by user.")
+            break
+        except Exception as e:
+            # On any error, flush partial data only if not already written
+            if win_start is not None and not vehicle_counted_for_window:
+                print(f"[error] Writing partial data due to error: {e}")
+                write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes=f"error: {e}")
+            else:
+                print(f"[reconnect] {e}")
+            time.sleep(5)
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+            if display:
+                try:
+                    cv2.destroyWindow(cam_slug)
+                except Exception:
+                    pass
+
+def write_window(csv_path, win_start, win_end, counts, frames_processed, tz, notes=""):
+    """บันทึกข้อมูลการนับรถลงในไฟล์ CSV ในรูปแบบที่เหมาะสำหรับโมเดล ML"""
+    from utils import get_lag_values  # Import here to avoid circular imports
+    
+    # ใช้ win_start เป็น timestamp เพื่อให้ตรงกับหน้าต่างเวลาที่กำหนด
+    dt = win_start
+    
+    # ข้อมูลหลัก - ใช้รูปแบบ timestamp ตามตัวอย่าง DD/MM/YYYY HH:MM
+    formatted_timestamp = dt.strftime('%d/%m/%Y %H:%M')
+    
+    # ตรวจสอบว่ามีข้อมูลซ้ำใน CSV หรือไม่
+    if os.path.exists(csv_path):
+        try:
+            existing_df = pd.read_csv(csv_path)
+            if not existing_df.empty and formatted_timestamp in existing_df['timestamp'].values:
+                print(f"[csv] Timestamp {formatted_timestamp} already exists in CSV, skipping write")
+                return
+        except Exception as e:
+            print(f"[csv] Warning: Could not check for duplicate timestamps: {e}")
+    
+    # นับรวมรถทุกประเภทเป็น vehicle_count เพียงค่าเดียว พร้อมตรวจสอบค่าที่เกินจริง
+    vehicle_count = sum(counts.values())
+    
+    # Debug: แสดงข้อมูลการนับรถ
+    print(f"[csv] Preparing to write: timestamp={formatted_timestamp}, vehicle_count={vehicle_count}, counts={counts}")
+    
+    # ตรวจสอบและแก้ไขค่าที่ผิดปกติ - ถ้าจำนวนรถสูงเกินไปสำหรับกล้องหนึ่งตัว (เช่น > 50 คัน)
+    # อาจเป็นเพราะการตรวจจับผิดพลาดหรือนับซ้ำ - จำกัดค่าไม่ให้เกิน 50
+    MAX_REASONABLE_COUNT = 50
+    if vehicle_count > MAX_REASONABLE_COUNT:
+        print(f"[warning] Unusually high vehicle count: {vehicle_count}, capping at {MAX_REASONABLE_COUNT}")
+        print(f"[warning] Original counts by type: {counts}")
+        vehicle_count = MAX_REASONABLE_COUNT
+    
+    # สร้าง lag values (ค่าย้อนหลัง 1, 2, 3 คาบเวลา)
+    lag_1, lag_2, lag_3 = get_lag_values(csv_path, dt)
+    
+    # ข้อมูลเกี่ยวกับเวลา
+    day_of_week = dt.strftime('%A')  # ชื่อวัน (Monday, Tuesday, ...)
+    hour = dt.hour  # ชั่วโมง (0-23)
+    
+    # สร้าง row สำหรับบันทึก CSV - เฉพาะ columns ที่จำเป็นสำหรับโมเดล
+    row = {
+        "timestamp": formatted_timestamp,
+        "vehicle_count": int(vehicle_count),
+        "lag_1": lag_1,
+        "lag_2": lag_2,
+        "lag_3": lag_3,
+        "day_of_week": day_of_week,
+        "hour": hour
+    }
+    
+    # Debug: แสดงข้อมูลที่จะเขียนลง CSV
+    print(f"[csv] Writing row to CSV: {row}")
+    
+    # บันทึกลง CSV พร้อมล็อคไฟล์เพื่อป้องกันการเขียนซ้ำจากหลายโปรเซส
+    try:
+        df = pd.DataFrame([row])
+        hdr = not os.path.exists(csv_path)
+        
+        # ใช้การเขียนแบบอะตอมิก (atomic write) เพื่อป้องกันการเสียหายของไฟล์
+        temp_path = csv_path + ".tmp"
+        
+        # ถ้าไฟล์ CSV มีอยู่แล้ว ให้โหลดข้อมูลเดิมก่อน
+        if os.path.exists(csv_path):
+            existing_df = pd.read_csv(csv_path)
+            # เพิ่มข้อมูลใหม่เข้าไป
+            combined_df = pd.concat([existing_df, df], ignore_index=True)
+        else:
+            combined_df = df
+        
+        # เขียนไฟล์ temporary
+        combined_df.to_csv(temp_path, index=False)
+        
+        # ย้ายไฟล์ temporary ไปแทนที่ไฟล์หลัก (atomic operation)
+        if os.path.exists(temp_path):
+            if os.path.exists(csv_path):
+                os.remove(csv_path)
+            os.rename(temp_path, csv_path)
+            
+        print(f"[{dt.strftime('%H:%M')}] {os.path.basename(csv_path)} +1 row (vehicle_count={vehicle_count}, timestamp={formatted_timestamp}) - SUCCESS")
+        
+    except Exception as e:
+        print(f"[csv] Error writing to CSV: {e}")
+        # ถ้าเขียนแบบ atomic ไม่ได้ ให้ลองเขียนแบบปกติ
+        try:
+            df = pd.DataFrame([row])
+            hdr = not os.path.exists(csv_path)
+            df.to_csv(csv_path, mode="a", header=hdr, index=False)
+            print(f"[{dt.strftime('%H:%M')}] {os.path.basename(csv_path)} +1 row (vehicle_count={vehicle_count}, timestamp={formatted_timestamp}) - FALLBACK SUCCESS")
+        except Exception as e2:
+            print(f"[csv] Failed to write CSV even with fallback method: {e2}")
+
+def save_snapshot(snapshot_path: str, frame):
+    """
+    Save one latest snapshot image. If an older image exists, delete it first
+    and then write the new one. The frame is the exact image used for YOLO detection.
+    """
+    try:
+        if os.path.exists(snapshot_path):
+            try:
+                os.remove(snapshot_path)
+            except Exception:
+                # If deletion fails (e.g., locked), continue to overwrite
+                pass
+    except Exception as e:
+        print(f"[snapshot] Error removing old snapshot: {e}")
+                
+    # Check if frame is valid
+    if frame is None or frame.size == 0:
+        raise ValueError("Invalid frame - frame is None or empty")
+    
+    try:
+        # ตรวจสอบว่าภาพเป็นภาพขาวหรือไม่
+        is_blank = False
+        # คำนวณพิกเซลที่ไม่ใช่สีขาว (นับเฉพาะพิกเซลที่มีค่ามากกว่า 240 ในทุกช่องสี)
+        non_white_pixels = np.sum(np.any(frame < 240, axis=2))
+        total_pixels = frame.shape[0] * frame.shape[1]
+        white_percentage = 100 - (non_white_pixels * 100 / total_pixels)
+        
+        # ถ้าภาพมีพื้นที่สีขาวมากกว่า 95% ถือว่าเป็นภาพขาว
+        if white_percentage > 95:
+            is_blank = True
+            print(f"[warning] Image appears to be blank (white): {white_percentage:.1f}% white pixels")
+            # บันทึกข้อความแจ้งเตือนลงในภาพ
+            cv2.putText(frame, "WARNING: BLANK IMAGE", (10, frame.shape[0] // 2), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"{white_percentage:.1f}% white pixels", (10, (frame.shape[0] // 2) + 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+            
+        # Debug image information
+        h, w = frame.shape[:2]
+        print(f"[snapshot] Saving image: {w}x{h}, dtype={frame.dtype}, shape={frame.shape}")
+            
+        # Make a copy of the frame to avoid any reference issues
+        frame_copy = frame.copy()
+        
+        # Draw timestamp on the image
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # cv2.putText(frame_copy, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+        #            0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        
+        # Write JPEG image with high quality (95%)
+        ok = cv2.imwrite(snapshot_path, frame_copy, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            raise RuntimeError("cv2.imwrite returned False")
+            
+        # Verify file was actually written
+        if not os.path.exists(snapshot_path) or os.path.getsize(snapshot_path) < 1000:  # < 1KB is suspicious
+            raise RuntimeError(f"Snapshot file too small: {os.path.getsize(snapshot_path) if os.path.exists(snapshot_path) else 0} bytes")
+        
+        status = "WARNING: BLANK IMAGE" if is_blank else "OK"
+        print(f"[snapshot] Successfully saved {os.path.getsize(snapshot_path)} bytes to {snapshot_path} (Status: {status})")
+        
+        return not is_blank  # คืนค่า True ถ้าภาพไม่ใช่ภาพขาว
+    except Exception as e:
+        print(f"[snapshot] Error saving snapshot: {e}")
+        raise
+
+def main():
+    ap = argparse.ArgumentParser(description="Traffic Monitoring with YOLOv8 and Time-Series CSV Output")
+    ap.add_argument("--cameras", default="config/cameras.json", help="Path to cameras.json configuration file")
+    ap.add_argument("--bin_minutes", type=int, default=5, help="Time window in minutes for data aggregation")
+    ap.add_argument("--frame_step_sec", type=float, default=2.0, help="Seconds between processed frames (controls CPU usage)")
+    ap.add_argument("--model", default="yolov8n.pt", help="YOLOv8 model path (default: yolov8n.pt for best performance)")
+    ap.add_argument("--out_dir", default="data", help="Output directory for CSV files and snapshots")
+    ap.add_argument("--display", action="store_true", help="Show frames for debugging; press q to quit")
+    args = ap.parse_args()
+
+    with open(args.cameras, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    tz = cfg.get("timezone", "Asia/Bangkok")
+    cameras = [c for c in cfg.get("cameras", []) if c.get("enabled", True)]
+
+    if not cameras:
+        raise SystemExit("No cameras enabled. Edit config/cameras.json or run scrape_bmatraffic.py.")
+
+    model = YOLO(args.model)
+
+    print(f"[setup] Using YOLOv8 model: {args.model}")
+    print(f"[setup] Data will be saved to: {args.out_dir}")
+    print(f"[setup] Time window: {args.bin_minutes} minutes")
+    print(f"[setup] Frame sampling: every {args.frame_step_sec} seconds")
+    print(f"[setup] Display mode: {'enabled' if args.display else 'disabled'}")
+    
+    # Simple sequential run (1 camera at a time). For multiple cams, run one process per camera.
+    for cam in cameras:
+        try:
+            print(f"Starting camera: {cam.get('name') or cam.get('slug')}")
+            aggregate_loop(cam, model, args.bin_minutes, args.frame_step_sec, args.out_dir, tz, display=args.display)
+        except KeyboardInterrupt:
+            print("\n[stop] Program stopped by user (Ctrl+C)")
+            break
+        except Exception as e:
+            print(f"[error] Camera failed: {e}")
+            time.sleep(3)
+
+if __name__ == "__main__":
+    main()
