@@ -8,6 +8,29 @@ from datetime import datetime, timedelta
 import os
 import time
 from PIL import Image
+import sys
+
+# Handle numpy._core compatibility globally (do this once)
+def setup_numpy_compatibility():
+    """Set up numpy._core compatibility once at startup"""
+    if 'numpy._core' not in sys.modules:
+        try:
+            # For newer numpy versions that have _core
+            if hasattr(np, '_core'):
+                sys.modules['numpy._core'] = np._core
+            # For older numpy versions, use core
+            elif hasattr(np, 'core'):
+                sys.modules['numpy._core'] = np.core
+            else:
+                # Create a minimal dummy module
+                import types
+                dummy_core = types.ModuleType('numpy._core')
+                sys.modules['numpy._core'] = dummy_core
+        except Exception:
+            pass  # If all else fails, continue without compatibility
+
+# Initialize numpy compatibility
+setup_numpy_compatibility()
 
 # Set page configuration
 st.set_page_config(
@@ -33,8 +56,9 @@ def load_models():
         try:
             with open(path, 'rb') as f:
                 models[interval] = pickle.load(f)
+            print(f"✅ Successfully loaded {interval} model")
         except Exception as e:
-            st.error(f"Error loading {interval} model from {path}: {e}")
+            st.error(f"❌ Error loading {interval} model: {e}")
             models[interval] = None
     
     return models
@@ -43,7 +67,13 @@ def create_sample_data_from_timestamp(timestamp_obj):
     """Create sample input based on a timestamp from the dataset"""
     # Handle both string and Timestamp objects
     if isinstance(timestamp_obj, str):
-        dt = datetime.strptime(timestamp_obj, '%d/%m/%Y %H:%M')
+        try:
+            dt = datetime.strptime(timestamp_obj, '%d/%m/%Y %H:%M')
+        except ValueError:
+            try:
+                dt = datetime.strptime(timestamp_obj, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                dt = pd.to_datetime(timestamp_obj, dayfirst=True).to_pydatetime()
     else:
         # timestamp_obj is already a pandas Timestamp, use it directly
         dt = timestamp_obj
@@ -61,8 +91,16 @@ def create_sample_data_from_timestamp(timestamp_obj):
 def load_data():
     """Load the traffic training dataset with all target intervals"""
     try:
-        df = pd.read_csv('D:/eco_project/Dashboard_update/traffic_dataset_with_targets.csv')
-        df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        df = pd.read_csv('D:/eco_project/Dashboard_update/traffic_dataset_main.csv')
+        # Handle different possible timestamp formats
+        try:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], format='%d/%m/%Y %H:%M')
+            except ValueError:
+                # Let pandas infer the format
+                df['timestamp'] = pd.to_datetime(df['timestamp'], dayfirst=True)
         
         # Rename lag columns to match existing code
         df = df.rename(columns={
@@ -86,8 +124,8 @@ def load_data():
 def load_current_data():
     """Load the current data for prediction - refreshes every time to get latest data"""
     try:
-        csv_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/sathon12_footbridge_id996_5min.csv'
-        
+        # csv_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/sathon12_footbridge_id996_5min.csv'
+        csv_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/sathon12_footbridge_id1748_5min.csv'
         # Check if file exists
         if not os.path.exists(csv_path):
             st.error(f"CSV file not found: {csv_path}")
@@ -127,9 +165,9 @@ def load_cctv_images():
     images = {}
     
     # Raw image path
-    raw_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id996.jpg.raw.jpg'
+    raw_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id1748.jpg.raw.jpg'
     # Detected image path
-    detected_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id996.jpg'
+    detected_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id1748.jpg'
 
     try:
         # Load raw image
@@ -483,6 +521,10 @@ def prediction_page(models, data, current_data):
             else:
                 selected_record = latest_records.iloc[selected_idx]
             
+            # Clear manual predictions when using current predict
+            if 'manual_predictions' in st.session_state:
+                del st.session_state.manual_predictions
+            
             st.session_state.auto_predict = True
             st.session_state.predict_record = selected_record
             st.rerun()
@@ -497,6 +539,9 @@ def prediction_page(models, data, current_data):
             st.session_state.auto_predict = False
             if 'predict_record' in st.session_state:
                 del st.session_state.predict_record
+            # Clear manual predictions when resetting
+            if 'manual_predictions' in st.session_state:
+                del st.session_state.manual_predictions
             st.rerun()
     
     st.markdown("---")
@@ -563,7 +608,37 @@ def prediction_page(models, data, current_data):
             
             submit_button = st.form_submit_button("Manual Predict", type="primary", use_container_width=True)
         
-        # Show Input Data Summary and Data Source Info below Manual Input Features
+        # Show Manual Input Summary and Main: Next Hour below Manual Input Features (for manual predictions)
+        if 'manual_predictions' in st.session_state and st.session_state.manual_predictions:
+            st.divider()
+            
+            # Create two columns for Manual Input Summary and Main Metric
+            manual_col1, manual_col2 = st.columns([1, 1])
+            
+            with manual_col1:
+                st.subheader("Manual Input Summary")
+                input_summary = pd.DataFrame({
+                    'Feature': ['Vehicle Count', 'Lag 1 (5min)', 'Lag 2 (10min)', 'Lag 3 (15min)', 'Hour', 'Day of Week'],
+                    'Value': [str(st.session_state.manual_vehicle_count), str(st.session_state.manual_lag_1), 
+                             str(st.session_state.manual_lag_2), str(st.session_state.manual_lag_3), 
+                             str(st.session_state.manual_hour), str(st.session_state.manual_day_of_week)]
+                })
+                st.dataframe(input_summary, hide_index=True, use_container_width=True)
+            
+            with manual_col2:
+                st.subheader("Main Result")
+                # Show 1-hour prediction as main metric (if available)
+                if st.session_state.manual_predictions.get('1h') is not None:
+                    st.metric(
+                        label="Main: Next Hour",
+                        value=f"{st.session_state.manual_predictions['1h']:.1f} vehicles",
+                        delta=f"{st.session_state.manual_predictions['1h'] - st.session_state.manual_vehicle_count:.1f} from current"
+                    )
+                else:
+                    st.metric(label="Main: Next Hour", value="N/A")
+                    st.caption("1h model unavailable")
+        
+        # Show Input Data Summary and Data Source Info below Manual Input Features (for current predictions)
         if hasattr(st.session_state, 'auto_predict') and st.session_state.auto_predict:
             record = st.session_state.predict_record
             
@@ -813,10 +888,27 @@ def prediction_page(models, data, current_data):
         
         elif submit_button:
             try:
+                # Clear current predict when using manual predict
+                if 'auto_predict' in st.session_state:
+                    del st.session_state.auto_predict
+                if 'predict_record' in st.session_state:
+                    del st.session_state.predict_record
+                
+                # Store manual input values in session state
+                st.session_state.manual_vehicle_count = vehicle_count
+                st.session_state.manual_lag_1 = lag_1
+                st.session_state.manual_lag_2 = lag_2
+                st.session_state.manual_lag_3 = lag_3
+                st.session_state.manual_hour = hour
+                st.session_state.manual_day_of_week = day_of_week
+                
                 # Make multi-interval predictions
                 predictions = make_multi_interval_predictions(
                     models, vehicle_count, lag_1, lag_2, lag_3, day_of_week, hour, month, day, minute
                 )
+                
+                # Store predictions in session state
+                st.session_state.manual_predictions = predictions
                 
                 # Display result
                 st.success("🎯 Manual Multi-Interval Prediction Complete!")
@@ -861,28 +953,11 @@ def prediction_page(models, data, current_data):
                                     height=400)
                     st.plotly_chart(fig, use_container_width=True)
                 
-                # Create display for detailed analysis
-                col2_1, col2_2 = st.columns([1, 1])
-                
-                with col2_1:
-                    # Show 1-hour prediction as main metric (if available)
-                    if predictions.get('1h') is not None:
-                        st.metric(
-                            label="Main: Next Hour",
-                            value=f"{predictions['1h']:.1f} vehicles",
-                            delta=f"{predictions['1h'] - vehicle_count:.1f} from current"
-                        )
-                    else:
-                        st.metric(label="Main: Next Hour", value="N/A")
-                        st.caption("1h model unavailable")
-                    
-                    # Show additional prediction summary
-                    available_predictions = [interval for interval, pred in predictions.items() if pred is not None]
-                    st.info(f"Available models: {', '.join(available_predictions)}")
-                
-                with col2_2:
-                    # Create gauge chart for 1h prediction (if available)
-                    if predictions.get('1h') is not None:
+                # Show main gauge for 1 hour prediction (most important)
+                if predictions.get('1h') is not None:
+                    col_gauge1, col_gauge2 = st.columns(2)
+                    with col_gauge1:
+                        # Create gauge chart for 1h prediction
                         fig = go.Figure(go.Indicator(
                             mode = "gauge+number+delta",
                             value = predictions['1h'],
@@ -906,8 +981,37 @@ def prediction_page(models, data, current_data):
                         ))
                         fig.update_layout(height=300)
                         st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("1-hour model not available for gauge chart")
+                    
+                    with col_gauge2:
+                        # Create gauge chart for 5m prediction (shortest term)
+                        if predictions.get('5m') is not None:
+                            fig = go.Figure(go.Indicator(
+                                mode = "gauge+number+delta",
+                                value = predictions['5m'],
+                                domain = {'x': [0, 1], 'y': [0, 1]},
+                                title = {'text': "5-Minute Prediction"},
+                                delta = {'reference': vehicle_count},
+                                gauge = {
+                                    'axis': {'range': [None, 50]},
+                                    'bar': {'color': "darkgreen"},
+                                    'steps': [
+                                        {'range': [0, 10], 'color': "lightgray"},
+                                        {'range': [10, 25], 'color': "gray"},
+                                        {'range': [25, 50], 'color': "red"}
+                                    ],
+                                    'threshold': {
+                                        'line': {'color': "red", 'width': 4},
+                                        'thickness': 0.75,
+                                        'value': 30
+                                    }
+                                }
+                            ))
+                            fig.update_layout(height=300)
+                            st.plotly_chart(fig, use_container_width=True)
+                
+                # Show additional prediction summary
+                available_predictions = [interval for interval, pred in predictions.items() if pred is not None]
+                st.info(f"Available models: {', '.join(available_predictions)}")
                 
             except Exception as e:
                 st.error(f"Error making prediction: {e}")
