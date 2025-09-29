@@ -30,10 +30,8 @@ def class_filter_map(model):
     
     YOLOv8 classes ที่เกี่ยวข้อง:
     - 2: car
-    - 3: motorcycle
     - 5: bus
     - 7: truck
-    - 1: bicycle
     """
     # Build mapping from model.names id -> label string
     id_to_name = {int(i): n for i, n in model.names.items()} if hasattr(model, "names") else {}

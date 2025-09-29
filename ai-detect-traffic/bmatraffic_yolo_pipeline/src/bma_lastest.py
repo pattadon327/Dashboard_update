@@ -243,7 +243,7 @@ def resolve_stream_url(url: str, headers=None):
 
 # กำหนดประเภทยานพาหนะที่ต้องการนับ (ต้องตรงกับ VEHICLE_CLASS_NAMES ใน utils.py)
 # COCO dataset class IDs: 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck  
-SUPPORTED = {"bicycle", "car", "motorcycle", "bus", "truck"}
+SUPPORTED = {"car", "bus", "truck"}
 
 def open_stream(url: str):
     cap = cv2.VideoCapture(url)
@@ -1124,8 +1124,11 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                 # ปรับปรุง debug_frame เพื่อแสดงข้อมูลที่จำเป็นเท่านั้น
                 h, w = debug_frame.shape[:2]
                 
-                # แสดงจำนวนรถรวมที่จับได้
+                # แสดงจำนวนรถรวมที่จับได้ (จำกัดไม่เกิน 37 เช่นเดียวกับ csv)
                 total_vehicles = sum(counts.values())
+                MAX_REASONABLE_COUNT = 37
+                if total_vehicles > MAX_REASONABLE_COUNT:
+                    total_vehicles = MAX_REASONABLE_COUNT
                 cv2.putText(debug_frame, f"Vehicles: {total_vehicles}", (10, 30), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
@@ -1207,17 +1210,13 @@ def write_window(csv_path, win_start, win_end, counts, frames_processed, tz, not
         except Exception as e:
             print(f"[csv] Warning: Could not check for duplicate timestamps: {e}")
     
-    # นับรวมรถทุกประเภทเป็น vehicle_count เพียงค่าเดียว พร้อมตรวจสอบค่าที่เกินจริง
+    # นับรวมรถทุกประเภทเป็น vehicle_count เพียงค่าเดียว
     vehicle_count = sum(counts.values())
-    
-    # Debug: แสดงข้อมูลการนับรถ
-    print(f"[csv] Preparing to write: timestamp={formatted_timestamp}, vehicle_count={vehicle_count}, counts={counts}")
-    
-    # ตรวจสอบและแก้ไขค่าที่ผิดปกติ - ถ้าจำนวนรถสูงเกินไปสำหรับกล้องหนึ่งตัว (เช่น > 50 คัน)
-    # อาจเป็นเพราะการตรวจจับผิดพลาดหรือนับซ้ำ - จำกัดค่าไม่ให้เกิน 50
-    MAX_REASONABLE_COUNT = 50
+
+    # จำกัดจำนวนรถสูงสุดที่ 40 คัน
+    MAX_REASONABLE_COUNT = 40
     if vehicle_count > MAX_REASONABLE_COUNT:
-        print(f"[warning] Unusually high vehicle count: {vehicle_count}, capping at {MAX_REASONABLE_COUNT}")
+        print(f"[warning] Detected vehicle_count > 40: {vehicle_count}, capping at 40")
         print(f"[warning] Original counts by type: {counts}")
         vehicle_count = MAX_REASONABLE_COUNT
     
