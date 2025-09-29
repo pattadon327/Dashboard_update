@@ -20,8 +20,8 @@ default_args = {
 def check_traffic_process():
     """ตรวจสอบว่า traffic monitoring process ยังทำงานอยู่หรือไม่"""
     try:
-        # ตรวจสอบ process ที่รัน stream_to_counts.py
-        result = subprocess.run(['pgrep', '-f', 'stream_to_counts.py'], 
+        # ตรวจสอบ process ที่รัน bma_lastest.py
+        result = subprocess.run(['pgrep', '-f', 'bma_lastest.py'], 
                               capture_output=True, text=True)
         if result.returncode == 0:
             print(f"Traffic monitoring process is running: PID {result.stdout.strip()}")
@@ -44,31 +44,23 @@ def start_traffic_monitoring():
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(f"{output_dir}/snapshots", exist_ok=True)
         
-        print("🚦 Starting lightweight traffic monitoring...")
+        print("🚦 Starting traffic monitoring with bma_lastest.py ...")
         
-        # เริ่มต้น traffic monitoring (ปรับพารามิเตอร์ให้เบา)
+        # ใช้ bma_lastest.py แทน stream_to_counts.py และ argument ตามที่ user ใช้จริง
         cmd = [
-            'python', 
-            f'{dashboard_path}/stream_to_counts.py',
+            'python',
+            f'{dashboard_path}/bma_lastest.py',
             '--cameras', cameras_config,
-            '--bin_minutes', '10',  # เพิ่มเป็น 10 นาที (เบากว่า)
-            '--frame_step_sec', '5',  # ประมวลผลทุก 5 วินาที (เบากว่า)
-            '--out_dir', output_dir,
-            '--model', f'{dashboard_path}/yolov8n.pt'  # ใช้โมเดล nano (เบาที่สุด)
+            '--bin_minutes', '5',
+            '--frame_step_sec', '2',
+            '--display'  # เพิ่ม --display ตามตัวอย่าง user
         ]
-        
         print(f"Starting traffic monitoring with command: {' '.join(cmd)}")
-        
-        # รันใน background โดยใช้ nohup
-        subprocess.Popen(cmd, cwd=dashboard_path, 
+        subprocess.Popen(cmd, cwd=dashboard_path,
                         stdout=open(f'{output_dir}/traffic_monitor.log', 'w'),
                         stderr=subprocess.STDOUT,
-                        preexec_fn=os.setsid)  # สร้าง process group ใหม่
-        
-        # รอสักครู่เพื่อให้ process เริ่มต้น
+                        preexec_fn=os.setsid)
         time.sleep(10)
-        
-        # ตรวจสอบว่า process เริ่มต้นสำเร็จหรือไม่
         if check_traffic_process():
             print("Traffic monitoring started successfully")
         else:
@@ -81,7 +73,7 @@ def start_traffic_monitoring():
 def stop_traffic_monitoring():
     """หยุด traffic monitoring process"""
     try:
-        result = subprocess.run(['pkill', '-f', 'stream_to_counts.py'], 
+        result = subprocess.run(['pkill', '-f', 'bma_lastest.py'], 
                               capture_output=True, text=True)
         print(f"Stopped traffic monitoring processes")
         time.sleep(5)  # รอให้ process หยุดอย่างสมบูรณ์

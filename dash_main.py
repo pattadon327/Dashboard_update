@@ -1214,7 +1214,7 @@ def prediction_page(models, data, current_data):
                         st.plotly_chart(fig, use_container_width=True)
                     
                     with col_gauge2:
-                        # Create gauge chart for 5m prediction (shortest term)
+                        # Create gauge chart for 5m prediction (shortest term) new
                         if predictions.get('5m') is not None:
                             fig = go.Figure(go.Indicator(
                                 mode = "gauge+number+delta",
