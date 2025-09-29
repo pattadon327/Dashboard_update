@@ -6,6 +6,52 @@ from typing import Optional
 from ultralytics import YOLO
 from utils import align_to_window, class_filter_map, now_local, slugify, get_lag_values
 from urllib.parse import urljoin, urlparse, parse_qs
+from shapely.geometry import Polygon, Point
+import cv2, numpy as np, requests
+
+# เก็บเฉพาะถนนฝั่งขวา
+ROI_RIGHT_INCLUDE_NORM = [
+    (0.45, 0.15),  # บนซ้ายของฝั่งขวา (ร่นซ้ายเล็กน้อยเพื่อให้ center ของรถเข้า ROI ง่ายขึ้น)
+    (0.80, 0.15),  # บนขวา
+    (1.00, 1.00),  # ล่างขวา
+    (0.10, 1.00),  # ล่างซ้ายของฝั่งขวา
+]
+
+
+def norm_to_abs_points(norm_pts, w, h):
+    def clamp(v, lo, hi): 
+        return max(lo, min(int(round(v)), hi))
+    pts = []
+    for (x, y) in norm_pts:
+        px = clamp(x * (w - 1), 0, w - 1)
+        py = clamp(y * (h - 1), 0, h - 1)
+        pts.append((px, py))
+    return np.array(pts, dtype=np.int32)
+
+
+def apply_polygon_mask(frame, poly_pts_abs, *, exclude=False):
+    """
+    exclude=False (default)  : เก็บเฉพาะ 'ใน' polygon
+    exclude=True             : ตัดทิ้ง 'ใน' polygon (เก็บเฉพาะนอก polygon)
+    """
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    if exclude:
+        # ตัด polygon ทิ้ง ⇒ ด้านใน = 0, ด้านนอก = 255
+        cv2.fillPoly(mask, [poly_pts_abs], 0)
+        mask[mask == 0] = 0
+        mask[mask == 255] = 255
+        # เติมพื้นหลังเป็น 255 ก่อนแล้วค่อยทับ polygon ด้วย 0
+        mask[:] = 255
+        cv2.fillPoly(mask, [poly_pts_abs], 0)
+    else:
+        cv2.fillPoly(mask, [poly_pts_abs], 255)
+
+    roi = cv2.bitwise_and(frame, frame, mask=mask)
+    return roi, mask
+
+
+
+
 
 def enhance_image_for_detection(image):
     """
@@ -101,6 +147,176 @@ def detect_lighting_condition(image):
         return 'bright'
     else:
         return 'day'
+
+def bilinear(u, v, TL, TR, BR, BL):
+    """
+    แปลงพิกัด (u,v) ในสี่เหลี่ยมหน่วย -> พิกัดภาพในควอดริเลเทอรัล (TL,TR,BR,BL)
+    u: 0..1 (ซ้าย->ขวา), v: 0..1 (บน->ล่าง)
+    """
+    top = (1 - u) * TL + u * TR
+    bot = (1 - u) * BL + u * BR
+    return (1 - v) * top + v * bot
+
+def lane_boundary_polyline(u_frac, TL, TR, BR, BL, samples=80):
+    """คืน polyline (Nx2) ของเส้นแบ่งเลนที่ตำแหน่ง u เท่ากับ u_frac"""
+    vv = np.linspace(0.0, 1.0, samples)
+    pts = [bilinear(u_frac, v, TL, TR, BR, BL) for v in vv]
+    return np.array(pts, dtype=np.int32)
+
+def lane_polygon(u0, u1, TL, TR, BR, BL, samples=80):
+    """พหุเหลี่ยมของเลนระหว่างเส้น u0 และ u1"""
+    left_line  = lane_boundary_polyline(u0, TL, TR, BR, BL, samples)
+    right_line = lane_boundary_polyline(u1, TL, TR, BR, BL, samples)
+    poly = np.vstack([left_line, right_line[::-1]])
+    return poly  # shape (2*samples, 2)
+
+def create_lane_polygons(poly_pts_abs, nlanes=5):
+    """สร้างพหุเหลี่ยมของเลนทั้งหมด"""
+    TL, TR, BR, BL = [poly_pts_abs[i] for i in range(4)]
+    lane_polys = []
+    
+    for i in range(nlanes):
+        u0 = i / nlanes
+        u1 = (i + 1) / nlanes
+        poly = lane_polygon(u0, u1, TL, TR, BR, BL)
+        lane_polys.append(poly)
+    
+    return lane_polys
+
+def assign_vehicles_to_lanes(vehicles, lane_polys):
+    """กำหนดรถให้กับเลนตามพื้นที่ทับซ้อนที่มากที่สุด"""
+    lane_counts = [0] * len(lane_polys)
+    vehicle_assignments = []
+    
+    for vehicle in vehicles:
+        x1, y1, x2, y2 = vehicle['bbox']
+        vehicle_poly = Polygon([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
+        
+        # หาเลนที่มีพื้นที่ทับซ้อนมากที่สุด
+        max_overlap = 0
+        assigned_lane = None
+        
+        for lane_idx, lane_poly in enumerate(lane_polys):
+            try:
+                lane_polygon_shape = Polygon(lane_poly)
+                intersection = vehicle_poly.intersection(lane_polygon_shape)
+                overlap_area = intersection.area if intersection.is_valid else 0
+                
+                if overlap_area > max_overlap:
+                    max_overlap = overlap_area
+                    assigned_lane = lane_idx
+            except:
+                # ใช้วิธีตรวจสอบจุดกึ่งกลางหากเกิดข้อผิดพลาด
+                center_x, center_y = vehicle['center']
+                point = Point(center_x, center_y)
+                if Polygon(lane_poly).contains(point):
+                    assigned_lane = lane_idx
+                    break
+        
+        if assigned_lane is not None:
+            lane_counts[assigned_lane] += 1
+        
+        vehicle_assignments.append({
+            **vehicle,
+            'lane': assigned_lane
+        })
+    
+    return vehicle_assignments, lane_counts
+
+def calculate_lane_densities_by_area(vehicles_with_lanes, lane_polys):
+    """คำนวณ density สำหรับแต่ละเลนจากพื้นที่รถต่อพื้นที่เลน (0-100%)"""
+    from shapely.geometry import Polygon
+    
+    densities = []
+    
+    for lane_idx, lane_poly in enumerate(lane_polys):
+        try:
+            # คำนวณพื้นที่ของเลน
+            lane_polygon_shape = Polygon(lane_poly)
+            lane_area = lane_polygon_shape.area
+            
+            if lane_area <= 0:
+                densities.append(0.0)
+                continue
+            
+            # รวมพื้นที่ของรถทั้งหมดในเลนนี้
+            total_vehicle_area = 0
+            
+            for vehicle in vehicles_with_lanes:
+                if vehicle.get('lane') == lane_idx:
+                    x1, y1, x2, y2 = vehicle['bbox']
+                    vehicle_polygon = Polygon([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
+                    
+                    # หาพื้นที่ทับซ้อนระหว่างรถกับเลน
+                    try:
+                        intersection = vehicle_polygon.intersection(lane_polygon_shape)
+                        if intersection.is_valid:
+                            total_vehicle_area += intersection.area
+                    except Exception:
+                        # ถ้าคำนวณ intersection ไม่ได้ ใช้พื้นที่รถทั้งหมด
+                        total_vehicle_area += vehicle_polygon.area
+            
+            # คำนวณ density เป็นเปอร์เซ็นต์
+            density = min((total_vehicle_area / lane_area) * 100, 100.0)
+            densities.append(density)
+            
+        except Exception as e:
+            print(f"[lane-density] Error calculating density for lane {lane_idx}: {e}")
+            densities.append(0.0)
+    
+    return densities
+
+def create_density_visualization(original_frame, poly_pts_abs, lane_densities, nlanes=5):
+    """สร้างภาพแสดง density ของแต่ละเลน"""
+    # สร้างภาพใหม่จากภาพต้นฉบับ
+    density_img = original_frame.copy()
+    overlay = original_frame.copy()
+    
+    # สร้างเลนทั้งหมด
+    TL, TR, BR, BL = [poly_pts_abs[i] for i in range(4)]
+    
+    for i in range(nlanes):
+        u0 = i / nlanes
+        u1 = (i + 1) / nlanes
+        poly = lane_polygon(u0, u1, TL, TR, BR, BL)
+        
+        # คำนวณสีตาม density (0% = เขียว, 100% = แดง)
+        density = lane_densities[i]
+        
+        if density <= 50:
+            # เขียวไปเหลือง (0-50%)
+            ratio = density / 50.0
+            color = (0, int(255 * (1 - ratio * 0.5)), int(255 * ratio))
+        else:
+            # เหลืองไปแดง (50-100%)
+            ratio = (density - 50) / 50.0
+            color = (0, int(255 * (1 - ratio)), 255)
+        
+        # วาดเลนด้วยสีที่คำนวณได้
+        cv2.fillPoly(overlay, [poly], color)
+        
+        # ลบการแสดงผล L1-L5 บน frame ออก - เหลือไว้เฉพาะข้อมูลใน CSV
+    
+    # ผสมภาพ overlay กับภาพต้นฉบับ (ความโปร่งใส 60%)
+    density_img = cv2.addWeighted(overlay, 0.6, density_img, 0.4, 0)
+    
+    # วาดเส้นแบ่งเลนสีแดง (เปลี่ยนจากสีเหลือง)
+    for i in range(1, nlanes):  # วาดเส้นแบ่งระหว่างเลน (ไม่รวมขอบซ้าย-ขวาสุด)
+        u_frac = i / nlanes
+        lane_line = lane_boundary_polyline(u_frac, TL, TR, BR, BL, samples=80)
+        cv2.polylines(density_img, [lane_line], isClosed=False, color=(0, 0, 255), thickness=1)  # สีแดง (0,0,255)
+    
+    # วาดกรอบ ROI - เปลี่ยนเป็นสีแดง
+    cv2.polylines(density_img, [np.int32(poly_pts_abs)], isClosed=True, color=(0, 0, 255), thickness=3)
+    
+    # เพิ่มข้อมูลสรุป - Average Density สีเขียว
+    y_pos = 30
+    total_density = sum(lane_densities) / len(lane_densities)
+    summary_text = f"Average Density: {total_density:.1f}%"
+    # เปลี่ยนสีเป็นสีเขียว (0, 255, 0) แทนสีขาว
+    cv2.putText(density_img, summary_text, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    
+    return density_img
 
 def resolve_stream_url(url: str, headers=None):
     """
@@ -198,7 +414,12 @@ def resolve_stream_url(url: str, headers=None):
 
 # กำหนดประเภทยานพาหนะที่ต้องการนับ (ต้องตรงกับ VEHICLE_CLASS_NAMES ใน utils.py)
 # COCO dataset class IDs: 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck  
-SUPPORTED = {"bicycle", "car", "motorcycle", "bus", "truck"}
+SUPPORTED = {"car", "bus", "truck"}
+
+# ======= LANE DIVISION CONFIG =======
+NLANES = 5                   # จำนวนเลนที่ต้องการแบ่ง
+MAX_VEHICLES_PER_LANE = 7    # จำนวนรถสูงสุดต่อเลน (100% density)
+SAMPLES_ALONG = 80           # จำนวนจุดสุ่มตามแนวยาว (สำหรับเส้นโค้งเลน)
 
 def open_stream(url: str):
     cap = cv2.VideoCapture(url)
@@ -724,9 +945,9 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                 
                 # กำหนด confidence threshold ตามสภาพแสง
                 if lighting_condition == 'night':
-                    confidence_threshold = 0.10  # ลดลงสำหรับกลางคืน
+                    confidence_threshold = 0.05  # ลดลงสำหรับกลางคืนให้ไวขึ้น
                 elif lighting_condition == 'dawn_dusk':
-                    confidence_threshold = 0.12  # ค่ากลางสำหรับเวลาเช้า/เย็น
+                    confidence_threshold = 0.15  # ค่ากลางสำหรับเวลาเช้า/เย็น
                 elif lighting_condition == 'bright':
                     confidence_threshold = 0.20  # เพิ่มขึ้นสำหรับแสงจ้า (ลด false positive)
                 else:  # day
@@ -792,14 +1013,74 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                     debug_frame = yolo_frame.copy()  # ใช้ภาพ raw ที่จะส่งเข้า YOLO
                 else:
                     debug_frame = yolo_frame
-                    
+
+                h_img, w_img = enhanced_frame.shape[:2]
+                poly_pts_abs = norm_to_abs_points(ROI_RIGHT_INCLUDE_NORM, w_img, h_img)
+
+                # วาด ROI ให้เห็นชัดเจนขึ้น: เส้นสีเขียวหนา 2px เพื่อให้เห็นชัดเจนโดยไม่ต้องระบายสี
+                cv2.polylines(debug_frame, [poly_pts_abs], True, (0,0,255), 2)
+                
+                # เพิ่มข้อความที่พื้นที่ ROI
+                # cv2.putText(debug_frame, "ROI", 
+                        #    (poly_pts_abs[0][0] + 10, poly_pts_abs[0][1] + 30),
+                        #    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                # ทำ mask ให้ส่วนที่อยู่นอก polygon กลายเป็น 0
+                roi_frame, roi_mask = apply_polygon_mask(enhanced_frame, poly_pts_abs, exclude=False)
+                roi_coverage = (roi_mask > 0).mean()
+                print(f"[roi] coverage: {roi_coverage*100:.1f}%")
+                if roi_coverage < 2/100:
+                    print("[roi][warning] ROI area too small → detections may be zero")
+
+                # ฟังก์ชันช่วยเช็คว่า center หรือ bottom-center ของกล่องอยู่ใน ROI หรือไม่
+                def center_in_mask(x1, y1, x2, y2, m):
+                    cx, cy = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+                    if cx < 0 or cy < 0 or cy >= m.shape[0] or cx >= m.shape[1]:
+                        return False
+                    return m[cy, cx] > 0
+
+                def bottom_center_in_mask(x1, y1, x2, y2, m):
+                    cx, by = (int((x1 + x2) / 2), int(max(y1, y2)))
+                    by = min(max(by - 2, 0), m.shape[0] - 1)  # เลื่อนขึ้นเล็กน้อยจากขอบล่างของกล่อง
+                    if cx < 0 or by < 0 or by >= m.shape[0] or cx >= m.shape[1]:
+                        return False
+                    return m[by, cx] > 0
+                
+
                 # YOLO inference - ใช้ภาพที่ปรับปรุงแล้ว
                 # กำหนดค่าเริ่มต้นสำหรับการแสดงผล
                 all_detections = []
                 
                 try:
                     print(f"[yolo] Running inference on enhanced frame: {enhanced_frame.shape} (lighting: {lighting_condition})")
-                    res = model.predict(source=enhanced_frame, verbose=False, device=0 if os.environ.get("YOLO_GPU","").strip() else None)
+                    # กำหนด classes เฉพาะยานพาหนะ และส่งค่า conf แบบไดนามิกเข้าโมเดลเพื่อลดการกรองก่อนเวลาอันควร
+                    classes_of_interest = None
+                    # สร้าง classes_of_interest แบบปลอดภัย (fallback เป็น None = ไม่ส่งพารามิเตอร์)
+                    classes_of_interest = None
+                    try:
+                        if isinstance(model.names, dict):
+                            classes_of_interest = [i for i, n in model.names.items() if n in SUPPORTED]
+                        elif isinstance(model.names, (list, tuple)):
+                            classes_of_interest = [i for i, n in enumerate(model.names) if n in SUPPORTED]
+                        if not classes_of_interest:
+                            classes_of_interest = None
+                        print(f"[yolo] classes_of_interest: {classes_of_interest}")
+                    except Exception as e:
+                        print(f"[yolo] Could not derive classes_of_interest: {e}")
+                        classes_of_interest = None
+
+                    predict_kwargs = dict(
+                        source=enhanced_frame,
+                        verbose=False,
+                        device=0 if os.environ.get("YOLO_GPU", "").strip() else None,
+                        conf=confidence_threshold,
+                    )
+                    if classes_of_interest is not None:
+                        predict_kwargs["classes"] = classes_of_interest
+
+                    res = model.predict(**predict_kwargs)
+
+
                     if not res:
                         print("[yolo] No results from YOLO model")
                         frames_processed += 1
@@ -823,20 +1104,39 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                             h, w = debug_frame.shape[:2]
                             current_time = win_start.strftime("%H:%M")
                             
-                            # แสดงจำนวนรถ 0
+                            # แสดงจำนวนรถ 0 - เปลี่ยนเป็นสีเขียว
                             cv2.putText(debug_frame, "Vehicles: 0", (10, 30), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                             
-                            # แสดงเวลา (ไม่แสดงวันที่)
+                            # แสดงเวลา (ไม่แสดงวันที่) - เปลี่ยนเป็นสีเขียว
                             cv2.putText(debug_frame, f"Time: {current_time}", (10, 70), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                            
+
                             # บันทึกภาพที่มีข้อมูลเพิ่มเติมแล้ว
                             ok = cv2.imwrite(snapshot_path, debug_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
                             if ok:
                                 print(f"[point-annotated] Successfully saved annotated image (no vehicles): {os.path.basename(snapshot_path)}")
                             else:
                                 print(f"[point-annotated] Failed to save annotated image")
+                            
+                            # สร้างและบันทึกภาพ density visualization สำหรับกรณีไม่มีรถ
+                            try:
+                                lane_densities = [0.0] * 5  # ทุกเลนมี density 0%
+                                lane_counts = [0] * 5  # ทุกเลนมี 0 คัน
+                                density_img = create_density_visualization(yolo_frame, poly_pts_abs, lane_densities, 5)
+                                density_path = snapshot_path.replace('.jpg', '_density_visualization.jpg')
+                                density_ok = cv2.imwrite(density_path, density_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                                if density_ok:
+                                    print(f"[density] Saved empty density visualization: {os.path.basename(density_path)}")
+                                    
+                                    # บันทึกข้อมูล lane densities ลง CSV สำหรับกรณีไม่มีรถ (เฉพาะ density)
+                                    lane_csv_path = snapshot_path.replace(".jpg", "_lane_densities.csv")
+                                    timestamp_str = win_start.strftime('%d/%m/%Y %H:%M')
+                                    save_lane_densities_csv(lane_csv_path, lane_densities, timestamp_str)
+                                else:
+                                    print(f"[density] Failed to save density visualization")
+                            except Exception as de:
+                                print(f"[density] Error creating density visualization for no vehicles: {de}")
                         except Exception as e:
                             print(f"[point-annotated] Error saving annotated image: {e}")
                         
@@ -857,11 +1157,86 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                                           if score > confidence_threshold]
                     print(f"[yolo] After threshold ({confidence_threshold}): {len(confident_detections)} valid detections")
                     
+                    # ถ้ายังไม่พบอะไรเลย ลอง fallback: รันทับอีกครั้งแบบไม่จำกัดคลาสและลด conf ลง
+                    if len(confident_detections) == 0:
+                        try:
+                            print("[fallback] No detections after threshold. Retrying without class filter at conf=0.05…")
+                            res2 = model.predict(
+                                source=enhanced_frame,
+                                verbose=False,
+                                device=0 if os.environ.get("YOLO_GPU", "").strip() else None,
+                                conf=0.05,
+                            )
+                            if res2:
+                                r2 = res2[0]
+                                if r2.boxes is not None and len(r2.boxes) > 0:
+                                    cls_ids = r2.boxes.cls.tolist()
+                                    confidence_scores = r2.boxes.conf.tolist()
+                                    boxes = r2.boxes.xyxy.cpu().numpy()
+                                    print(f"[fallback] Detected {len(cls_ids)} objects with confidence: {confidence_scores}")
+                                    confident_detections = [
+                                        (int(cid), score, box)
+                                        for cid, score, box in zip(cls_ids, confidence_scores, boxes)
+                                        if score > 0.05
+                                    ]
+                                    print(f"[fallback] After threshold (0.05): {len(confident_detections)} valid detections")
+                        except Exception as _e:
+                            print(f"[fallback] Error retrying detection: {_e}")
+                    
+                    # แสดงกรอบก่อนกรอง ROI (เส้นสีเหลืองบาง) เพื่อช่วย debug ว่า YOLO เห็นอะไรบ้าง
+                    pre_roi_count = len(confident_detections)
+                    for cid_dbg, score_dbg, box_dbg in confident_detections:
+                        x1d, y1d, x2d, y2d = map(int, box_dbg)
+                        cv2.rectangle(debug_frame, (x1d, y1d), (x2d, y2d), (0, 255, 255), 1)
+                    print(f"[roi] Pre-ROI detections: {pre_roi_count}")
+
+                    # หลังสร้าง confident_detections ด้วย threshold แล้ว
+                    # กรองโดยใช้ ROI_RIGHT_INCLUDE_NORM - เก็บเฉพาะรถที่อยู่ในพื้นที่ที่สนใจ (กันซ้ำด้วย set)
+                    roi_detections = []
+                    seen = set()
+                    for cid, score, box in confident_detections:
+                        x1, y1, x2, y2 = map(int, box)
+                        keep = False
+                        if center_in_mask(x1, y1, x2, y2, roi_mask) or bottom_center_in_mask(x1, y1, x2, y2, roi_mask):
+                            keep = True
+                        else:
+                            sub = roi_mask[max(y1,0):min(y2,roi_mask.shape[0]), max(x1,0):min(x2,roi_mask.shape[1])]
+                            if sub.size:
+                                overlap_ratio = (sub > 0).mean()
+                                if overlap_ratio > 0.10:
+                                    keep = True
+                        if keep:
+                            key = (int(x1), int(y1), int(x2), int(y2), int(cid))
+                            if key not in seen:
+                                roi_detections.append((cid, score, box))
+                                seen.add(key)
+
+                    # ถ้าตรวจพบก่อนกรอง ROI แต่หลังกรองเหลือศูนย์ ให้ผ่อนปรนอีกเล็กน้อย
+                    if pre_roi_count > 0 and len(roi_detections) == 0:
+                        print("[roi] No detections passed ROI filter. Relaxing overlap to 0.02 as fallback…")
+                        for cid, score, box in confident_detections:
+                            x1, y1, x2, y2 = map(int, box)
+                            if center_in_mask(x1, y1, x2, y2, roi_mask) or bottom_center_in_mask(x1, y1, x2, y2, roi_mask):
+                                roi_detections.append((cid, score, box))
+                                continue
+                            sub = roi_mask[max(y1,0):min(y2,roi_mask.shape[0]), max(x1,0):min(x2,roi_mask.shape[1])]
+                            if sub.size == 0:
+                                continue
+                            overlap_ratio = (sub > 0).mean()
+                            if overlap_ratio > 0.02:
+                                roi_detections.append((cid, score, box))
+
+                    confident_detections = roi_detections
+                    print(f"[yolo] After RIGHT-INCLUDE filter: {len(confident_detections)} detections (right side only)")
+
                     # นับรถทุกคันที่ตรวจพบในเฟรมนี้ (แค่ครั้งเดียวต่อหน้าต่างเวลา) โดยแยกตามประเภท
                     vehicles_in_frame = {k: 0 for k in SUPPORTED}
-                    
-                    # Count vehicles by class
+                    # กรองอีกชั้นด้วย ROI mask
+
+                    # สร้างข้อมูลรถสำหรับการแบ่งเลน
+                    vehicles_for_lanes = []
                     all_detections = []  # เก็บข้อมูลทุกการตรวจจับไว้แสดงผล
+                    
                     for cid, score, box in confident_detections:
                         label = id2name.get(cid)
                         # Debug: แสดงการแปลง class ID
@@ -871,6 +1246,18 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                         all_detections.append((cid, label or f"class_{cid}", score, box))
                         
                         if label and label in SUPPORTED:
+                            x1, y1, x2, y2 = map(int, box)
+                            center_x = int((x1 + x2) / 2)
+                            center_y = int((y1 + y2) / 2)
+                            
+                            # เก็บข้อมูลรถสำหรับการแบ่งเลน
+                            vehicles_for_lanes.append({
+                                'bbox': (x1, y1, x2, y2),
+                                'center': (center_x, center_y),
+                                'class_name': label,
+                                'confidence': score
+                            })
+                            
                             # เพิ่มค่าในประเภทของรถที่ตรวจพบในเฟรมนี้
                             vehicles_in_frame[label] += 1
                             # บันทึกลงในการนับรวมของหน้าต่างเวลานี้ (นับแค่ครั้งเดียว)
@@ -878,6 +1265,47 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                             print(f"[count] Added {label} to counts. Total {label}: {counts[label]}")
                         else:
                             print(f"[skip] Class ID {cid} (label: {label or 'None'}) not in SUPPORTED list: {SUPPORTED}")
+                    
+                    # ===== เพิ่มการแบ่งเลนและคำนวณ density =====
+                    lane_densities = [0] * 5
+                    if len(vehicles_for_lanes) > 0:
+                        print(f"[lanes] Processing {len(vehicles_for_lanes)} vehicles for lane assignment")
+                        
+                        # สร้างพหุเหลี่ยมเลน
+                        lane_polys = create_lane_polygons(poly_pts_abs, 5)
+                        
+                        # กำหนดรถให้กับเลน
+                        vehicle_assignments, lane_counts = assign_vehicles_to_lanes(vehicles_for_lanes, lane_polys)
+                        
+                        # คำนวณ density สำหรับแต่ละเลนจากพื้นที่
+                        lane_densities = calculate_lane_densities_by_area(vehicle_assignments, lane_polys)
+                        
+                        # แสดงผลการแบ่งเลน
+                        print(f"[lanes] Lane assignment results (by area coverage):")
+                        for i, (count, density) in enumerate(zip(lane_counts, lane_densities)):
+                            print(f"[lanes] Lane {i+1}: {count} vehicles ({density:.2f}% area density)")
+                        
+                        # สร้างภาพแสดง density
+                        try:
+                            density_img = create_density_visualization(yolo_frame, poly_pts_abs, lane_densities, 5)
+                            
+                            # บันทึกภาพ density
+                            density_path = snapshot_path.replace(".jpg", "_density_visualization.jpg")
+                            ok_density = cv2.imwrite(density_path, density_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                            if ok_density:
+                                print(f"[density] Saved density visualization: {os.path.basename(density_path)}")
+                                
+                                # บันทึกข้อมูล lane densities ลง CSV (เฉพาะ density)
+                                lane_csv_path = snapshot_path.replace(".jpg", "_lane_densities.csv")
+                                timestamp_str = win_start.strftime('%d/%m/%Y %H:%M')
+                                save_lane_densities_csv(lane_csv_path, lane_densities, timestamp_str)
+                            else:
+                                print(f"[density] Failed to save density image")
+                                
+                        except Exception as e:
+                            print(f"[density] Error creating density visualization: {e}")
+                    else:
+                        print(f"[lanes] No vehicles detected for lane processing")
                     
                     # แสดงการตรวจจับทั้งหมดที่พบ (ทั้งที่นับและไม่นับ)
                     print(f"[yolo] All detections: {[(d[1], d[2]) for d in all_detections]}")
@@ -907,17 +1335,35 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                         x1, y1, x2, y2 = obj_box
                         
                         # กำหนดสีต่างกันระหว่างวัตถุที่นับ (สีแดง) และไม่นับ (สีน้ำเงิน)
-                        box_color = (0, 0, 255) if obj_label in SUPPORTED else (255, 0, 0)
+                        # กำหนดสีกรอบตามประเภทยานพาหนะและตำแหน่ง (อยู่ใน ROI หรือไม่)
+                        is_in_roi = center_in_mask(x1, y1, x2, y2, roi_mask)
                         
-                        # วาดกรอบเท่านั้น ไม่ใส่ป้ายกำกับcurrent_time
+                        # สีเขียว = ในพื้นที่ ROI และนับได้, สีแดง = นอก ROI หรือประเภทไม่ได้นับ
+                        if is_in_roi and obj_label in SUPPORTED:
+                            box_color = (0, 255, 0)  # สีเขียว - ในพื้นที่ ROI และเป็นยานพาหนะที่นับ
+                            thickness = 2
+                        else:
+                            box_color = (0, 0, 255) if obj_label in SUPPORTED else (255, 0, 0)  # สีแดงหรือน้ำเงิน - นอกพื้นที่
+                            thickness = 1  # เส้นบางกว่าสำหรับรถที่ไม่อยู่ใน ROI
+                        
+                        # วาดกรอบรถพร้อมระบุประเภท
                         cv2.rectangle(debug_frame, 
                                     (int(x1), int(y1)), 
                                     (int(x2), int(y2)), 
-                                    box_color, 2)
+                                    box_color, thickness)
+                        
+                        # ไม่แสดงป้ายกำกับ class/เปอร์เซ็นต์ เหลือเฉพาะกรอบ bounding box
+                        # เดิม: putText ชื่อคลาสและคะแนนเหนือกรอบ
                     
                     # แสดงจำนวนรถที่พบในเฟรมนี้
                     total_in_frame = sum(vehicles_in_frame.values())
                     print(f"[yolo] Vehicles in current frame: {total_in_frame} {vehicles_in_frame}")
+                    
+                    # ไม่แสดงกล่องพื้นหลังสีดำมุมซ้ายบนอีกต่อไป (ลบ summary box)
+                    # เดิม: วาดกล่องสีดำและข้อความสรุปจำนวนรถตามคลาสที่มุมซ้ายบน
+                    # เหลือไว้เฉพาะข้อความ "Vehicles" และ "Time" สีเขียวที่ด้านล่างของบล็อกถัดไป
+                    
+                    # ไม่แสดงกล่องวันที่/เวลา (ลบ overlay มุมล่างขวา)
                     
                 except Exception as e:
                     print(f"[yolo] Error in YOLO inference: {e}")
@@ -928,8 +1374,11 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                 # ปรับปรุง debug_frame เพื่อแสดงข้อมูลที่จำเป็นเท่านั้น
                 h, w = debug_frame.shape[:2]
                 
-                # แสดงจำนวนรถรวมที่จับได้
+                # แสดงจำนวนรถรวมที่จับได้ (จำกัดไม่เกิน 37 เช่นเดียวกับ csv)
                 total_vehicles = sum(counts.values())
+                MAX_REASONABLE_COUNT = 37
+                if total_vehicles > MAX_REASONABLE_COUNT:
+                    total_vehicles = MAX_REASONABLE_COUNT
                 cv2.putText(debug_frame, f"Vehicles: {total_vehicles}", (10, 30), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
@@ -937,6 +1386,8 @@ def aggregate_loop(camera, model, bin_minutes=5, frame_step_sec=2, out_dir="data
                 current_time = win_start.strftime("%H:%M")
                 cv2.putText(debug_frame, f"Time: {current_time}", (10, 70), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                
+                # ลบการแสดง average density ออกจากภาพหลัก - ไปแสดงใน density visualization แทน
                 
                 # บันทึกภาพที่มีการวาดเพิ่มเติมแล้ว (point-in-time annotated image)
                 # บันทึกทันทีหลังจาก detection เสร็จ
@@ -1011,17 +1462,13 @@ def write_window(csv_path, win_start, win_end, counts, frames_processed, tz, not
         except Exception as e:
             print(f"[csv] Warning: Could not check for duplicate timestamps: {e}")
     
-    # นับรวมรถทุกประเภทเป็น vehicle_count เพียงค่าเดียว พร้อมตรวจสอบค่าที่เกินจริง
+    # นับรวมรถทุกประเภทเป็น vehicle_count เพียงค่าเดียว
     vehicle_count = sum(counts.values())
-    
-    # Debug: แสดงข้อมูลการนับรถ
-    print(f"[csv] Preparing to write: timestamp={formatted_timestamp}, vehicle_count={vehicle_count}, counts={counts}")
-    
-    # ตรวจสอบและแก้ไขค่าที่ผิดปกติ - ถ้าจำนวนรถสูงเกินไปสำหรับกล้องหนึ่งตัว (เช่น > 50 คัน)
-    # อาจเป็นเพราะการตรวจจับผิดพลาดหรือนับซ้ำ - จำกัดค่าไม่ให้เกิน 50
-    MAX_REASONABLE_COUNT = 50
+
+    # จำกัดจำนวนรถสูงสุดที่ 37 คัน
+    MAX_REASONABLE_COUNT = 37
     if vehicle_count > MAX_REASONABLE_COUNT:
-        print(f"[warning] Unusually high vehicle count: {vehicle_count}, capping at {MAX_REASONABLE_COUNT}")
+        print(f"[warning] Detected vehicle_count > 37: {vehicle_count}, capping at 37")
         print(f"[warning] Original counts by type: {counts}")
         vehicle_count = MAX_REASONABLE_COUNT
     
@@ -1083,6 +1530,33 @@ def write_window(csv_path, win_start, win_end, counts, frames_processed, tz, not
             print(f"[{dt.strftime('%H:%M')}] {os.path.basename(csv_path)} +1 row (vehicle_count={vehicle_count}, timestamp={formatted_timestamp}) - FALLBACK SUCCESS")
         except Exception as e2:
             print(f"[csv] Failed to write CSV even with fallback method: {e2}")
+
+def save_lane_densities_csv(csv_path: str, lane_densities, timestamp):
+    """
+    บันทึกข้อมูล lane densities ลงในไฟล์ CSV โดยเขียนทับไฟล์เดิม (เฉพาะ density เปอร์เซ็นต์)
+    """
+    try:
+        # สร้างข้อมูลสำหรับแต่ละเลน (เฉพาะ density)
+        data = {
+            'timestamp': [timestamp],
+            'L1_density': [f"{lane_densities[0]:.2f}%"],
+            'L2_density': [f"{lane_densities[1]:.2f}%"],
+            'L3_density': [f"{lane_densities[2]:.2f}%"],
+            'L4_density': [f"{lane_densities[3]:.2f}%"],
+            'L5_density': [f"{lane_densities[4]:.2f}%"],
+            'average_density': [f"{sum(lane_densities)/len(lane_densities):.2f}%"]
+        }
+        
+        # สร้าง DataFrame
+        df = pd.DataFrame(data)
+        
+        # เขียนทับไฟล์เดิม (overwrite)
+        df.to_csv(csv_path, index=False)
+        print(f"[lane-csv] Updated lane densities CSV: {os.path.basename(csv_path)}")
+        print(f"[lane-csv] L1:{lane_densities[0]:.2f}% L2:{lane_densities[1]:.2f}% L3:{lane_densities[2]:.2f}% L4:{lane_densities[3]:.2f}% L5:{lane_densities[4]:.2f}%")
+        
+    except Exception as e:
+        print(f"[lane-csv] Error saving lane densities CSV: {e}")
 
 def save_snapshot(snapshot_path: str, frame):
     """

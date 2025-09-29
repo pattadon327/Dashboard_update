@@ -159,13 +159,53 @@ def load_current_data():
         st.error(f"Error loading current data: {e}")
         return None
 
+# Load lane density data - NO CACHE for real-time updates
+def load_lane_density_data():
+    """Load the lane density data - refreshes every time to get latest data"""
+    try:
+        csv_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id1748_lane_densities.csv'
+        
+        # Check if file exists
+        if not os.path.exists(csv_path):
+            st.warning(f"Lane density CSV file not found: {csv_path}")
+            return None
+            
+        # Get file modification time for freshness check
+        file_mod_time = datetime.fromtimestamp(os.path.getmtime(csv_path))
+        
+        # Load CSV without any caching
+        df = pd.read_csv(csv_path)
+        
+        if df.empty:
+            st.warning("Lane density CSV file is empty")
+            return None
+            
+        # Parse timestamp
+        df['timestamp'] = pd.to_datetime(df['timestamp'], format='%d/%m/%Y %H:%M')
+        
+        # Convert percentage strings to float values
+        density_columns = ['L1_density', 'L2_density', 'L3_density', 'L4_density', 'L5_density', 'average_density']
+        for col in density_columns:
+            if col in df.columns:
+                df[col] = df[col].str.rstrip('%').astype('float')
+        
+        # Add file metadata for debugging
+        df.attrs['file_mod_time'] = file_mod_time
+        df.attrs['records_count'] = len(df)
+        df.attrs['load_time'] = datetime.now()
+        
+        return df
+    except Exception as e:
+        st.error(f"Error loading lane density data: {e}")
+        return None
+
 # Load CCTV images
 def load_cctv_images():
-    """Load CCTV images - raw and detected with force refresh"""
+    """Load CCTV images - detected and density visualization with force refresh"""
     images = {}
     
     # Raw image path
-    raw_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id1748.jpg.raw.jpg'
+    raw_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id1748_density_visualization.jpg'
     # Detected image path
     detected_image_path = 'D:/eco_project/Dashboard_update/ai-detect-traffic/bmatraffic_yolo_pipeline/src/data/snapshots/sathon12_footbridge_id1748.jpg'
 
@@ -263,6 +303,9 @@ def main():
     # Load current data fresh every time (no caching for real-time updates)
     current_data = load_current_data()
     
+    # Load lane density data fresh every time
+    lane_density_data = load_lane_density_data()
+    
     if data is None:
         st.error("Failed to load data. Please check the files.")
         return
@@ -309,7 +352,7 @@ def display_live_images():
             detected_placeholder = st.empty()
         
         with img_col2:
-            st.write("**Raw CCTV Image**")
+            st.write("**Density each lane**")
             raw_placeholder = st.empty()
     
     with status_container:
@@ -333,7 +376,7 @@ def display_live_images():
         with raw_placeholder.container():
             if images['raw'] is not None:
                 st.image(images['raw'], 
-                        caption=f"Raw - Last updated: {images['raw_timestamp']}", 
+                        caption=f"Density - Last updated: {images['raw_timestamp']}", 
                         use_column_width=True)
             else:
                 st.error("❌ Raw image not available")
@@ -373,6 +416,188 @@ def display_live_images():
             st.rerun()
     
     return images
+
+def display_lane_densities():
+    """Display lane density information with visualization"""
+    
+    st.subheader("🛣️ Lane Density Analysis - Real-time")
+    st.info("💡 ความหนาแน่นของรถในแต่ละเลน (Lane Density) จากการวิเคราะห์พื้นที่")
+    
+    # Load lane density data
+    lane_data = load_lane_density_data()
+    
+    if lane_data is None or lane_data.empty:
+        st.error("❌ ไม่สามารถโหลดข้อมูล Lane Density ได้")
+        return None
+    
+    # Get the latest record
+    latest_record = lane_data.iloc[-1]
+    
+    # Display freshness info
+    time_since_update = (datetime.now() - latest_record['timestamp']).total_seconds() / 60
+    current_time = datetime.now().strftime("%H:%M:%S")
+    
+    if time_since_update <= 5:
+        st.success(f"🟢 Lane density data is fresh (updated {time_since_update:.1f} minutes ago) - Last check: {current_time}")
+    elif time_since_update <= 15:
+        st.warning(f"🟡 Lane density data is moderately fresh (updated {time_since_update:.1f} minutes ago) - Last check: {current_time}")
+    else:
+        st.error(f"🔴 Lane density data may be stale (updated {time_since_update:.1f} minutes ago) - Last check: {current_time}")
+    
+    # Display lane densities
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.write("**Individual Lane Densities:**")
+        
+        # Create metrics for each lane
+        lane_cols = st.columns(5)
+        lane_names = ['L1_density', 'L2_density', 'L3_density', 'L4_density', 'L5_density']
+        lane_labels = ['Lane 1', 'Lane 2', 'Lane 3', 'Lane 4', 'Lane 5']
+        
+        for i, (lane_col, lane_label) in enumerate(zip(lane_names, lane_labels)):
+            with lane_cols[i]:
+                if lane_col in latest_record:
+                    density_value = latest_record[lane_col]
+                    
+                    # Color code based on density level
+                    if density_value >= 80:
+                        delta_color = "off"  # Red for high density
+                    elif density_value >= 50:
+                        delta_color = "normal"  # Orange for medium density  
+                    else:
+                        delta_color = "normal"  # Green for low density
+                    
+                    st.metric(
+                        label=lane_label,
+                        value=f"{density_value:.1f}%",
+                        delta=None
+                    )
+                    
+                    # Add color indicator
+                    if density_value >= 80:
+                        st.markdown("🔴 High")
+                    elif density_value >= 50:
+                        st.markdown("🟡 Medium")
+                    else:
+                        st.markdown("🟢 Low")
+                else:
+                    st.metric(label=lane_label, value="N/A")
+        
+        # Display average density
+        st.write("**Overall Traffic Density:**")
+        if 'average_density' in latest_record:
+            avg_density = latest_record['average_density']
+            
+            avg_col1, avg_col2 = st.columns(2)
+            with avg_col1:
+                st.metric(
+                    label="Average Density",
+                    value=f"{avg_density:.1f}%",
+                    delta=None
+                )
+            
+            with avg_col2:
+                # Traffic status based on average density
+                if avg_density >= 70:
+                    st.error("🚨 Heavy Traffic")
+                elif avg_density >= 40:
+                    st.warning("⚠️ Moderate Traffic")
+                else:
+                    st.success("✅ Light Traffic")
+    
+    with col2:
+        st.write("**Latest Update Info:**")
+        info_data = pd.DataFrame({
+            'Property': ['Timestamp', 'Data Age', 'Total Lanes', 'Avg Density'],
+            'Value': [
+                latest_record['timestamp'].strftime('%d/%m/%Y %H:%M'),
+                f"{time_since_update:.1f} min ago",
+                "5 lanes",
+                f"{latest_record['average_density']:.1f}%" if 'average_density' in latest_record else "N/A"
+            ]
+        })
+        st.dataframe(info_data, hide_index=True, use_container_width=True)
+    
+    # Visualization
+    st.write("**Lane Density Visualization:**")
+    
+    viz_col1, viz_col2 = st.columns(2)
+    
+    with viz_col1:
+        # Bar chart of individual lanes
+        lane_data_viz = {
+            'Lane': ['L1', 'L2', 'L3', 'L4', 'L5'],
+            'Density (%)': [latest_record[col] for col in lane_names if col in latest_record]
+        }
+        
+        if len(lane_data_viz['Density (%)']) == 5:
+            fig_bar = px.bar(
+                lane_data_viz,
+                x='Lane',
+                y='Density (%)',
+                title="Current Lane Densities",
+                color='Density (%)',
+                color_continuous_scale='RdYlGn_r'  # Red-Yellow-Green reversed
+            )
+            fig_bar.update_layout(height=300)
+            st.plotly_chart(fig_bar, use_container_width=True)
+    
+    with viz_col2:
+        # Gauge chart for average density
+        if 'average_density' in latest_record:
+            fig_gauge = go.Figure(go.Indicator(
+                mode = "gauge+number+delta",
+                value = latest_record['average_density'],
+                domain = {'x': [0, 1], 'y': [0, 1]},
+                title = {'text': "Average Density"},
+                gauge = {
+                    'axis': {'range': [None, 100]},
+                    'bar': {'color': "darkblue"},
+                    'steps': [
+                        {'range': [0, 40], 'color': "lightgreen"},
+                        {'range': [40, 70], 'color': "yellow"},
+                        {'range': [70, 100], 'color': "red"}
+                    ],
+                    'threshold': {
+                        'line': {'color': "red", 'width': 4},
+                        'thickness': 0.75,
+                        'value': 80
+                    }
+                }
+            ))
+            fig_gauge.update_layout(height=300)
+            st.plotly_chart(fig_gauge, use_container_width=True)
+    
+    # Historical data if available
+    if len(lane_data) > 1:
+        st.write("**Recent Lane Density History:**")
+        
+        # Show last 10 records
+        recent_data = lane_data.tail(10).copy()
+        recent_data['timestamp_str'] = recent_data['timestamp'].dt.strftime('%H:%M')
+        
+        # Melt data for plotting
+        plot_data = recent_data.melt(
+            id_vars=['timestamp_str', 'timestamp'],
+            value_vars=lane_names,
+            var_name='Lane',
+            value_name='Density'
+        )
+        plot_data['Lane'] = plot_data['Lane'].str.replace('_density', '')
+        
+        fig_history = px.line(
+            plot_data,
+            x='timestamp_str',
+            y='Density',
+            color='Lane',
+            title="Lane Density Trends (Last 10 records)",
+            labels={'timestamp_str': 'Time', 'Density': 'Density (%)'}
+        )
+        fig_history.update_layout(height=400)
+        st.plotly_chart(fig_history, use_container_width=True)
+    
+    return lane_data
 
 def check_data_freshness():
     """Check if CSV data is fresh and return status information"""
@@ -430,6 +655,11 @@ def prediction_page(models, data, current_data):
     
     st.divider()
     
+    # Display lane densities
+    lane_data = display_lane_densities()
+    
+    st.divider()
+    
     # Current data selector with real-time refresh
     st.subheader("📊 Current Data for Prediction")
     st.info("💡 ข้อมูลปัจจุบันจาก CCTV ถนนสาทร")
@@ -444,8 +674,9 @@ def prediction_page(models, data, current_data):
     current_time_check = time.time()
     if current_time_check - st.session_state.last_data_refresh >= 30:  # 30 seconds
         st.session_state.last_data_refresh = current_time_check
-        # Force reload current data
+        # Force reload current data and lane density data
         current_data = load_current_data()
+        lane_density_data = load_lane_density_data()
         st.rerun()
     
     # Display data freshness status
